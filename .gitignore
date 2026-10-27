@@ -1,0 +1,66 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+
+# env & secrets — NEVER commit real keys
+.env
+.env.*
+!.env.example
+
+# database (runtime data — schema lives in prisma/schema.prisma)
+/db/*.db
+/db/*.db-journal
+/db/*.sqlite
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# misc
+.DS_Store
+*.pem
+
+# typescript
+*.tsbuildinfo
+
+# vercel
+.vercel
+
+# local sandbox tooling (not part of the app)
+/dev.log
+/server.log
+/tool-results/
+/upload/
+/download/
+/examples/
+/mini-services/
+/skills/
+/.zscripts/
+/tests/
+/worklog.md
+/.claude
+/.z-ai-config
+/prompt
+/local-*
+/Caddyfile

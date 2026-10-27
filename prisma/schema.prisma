@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Member {
+  id                String    @id @default(cuid())
+  name              String
+  relation          String
+  role              String
+  color             String
+  isAdmin           Boolean   @default(false)
+  locationSharing   Boolean   @default(true)
+  locationLabel     String?
+  locationUpdatedAt DateTime?
+  createdAt         DateTime  @default(now())
+}
+
+model AppUser {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  password      String   @default("")
+  provider      String   @default("local")
+  name          String
+  role          String
+  relation      String
+  color         String
+  photoUrl      String?
+  memberId      String?
+  profileLocked Boolean  @default(false)
+  createdAt     DateTime @default(now())
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  assigneeId  String?
+  dueAt       DateTime?
+  priority    String    @default("medium")
+  status      String    @default("pending")
+  category    String?
+  recurring   String?
+  createdAt   DateTime  @default(now())
+}
+
+model GroceryItem {
+  id         String   @id @default(cuid())
+  name       String
+  quantity   String   @default("")
+  category   String   @default("Other")
+  status     String   @default("needed")
+  priority   String   @default("medium")
+  note       String?
+  assigneeId String?
+  visibility String   @default("household")
+  createdAt  DateTime @default(now())
+}
+
+model Medicine {
+  id            String    @id @default(cuid())
+  name          String
+  dosage        String
+  timeLabel     String
+  instructions  String?
+  memberId      String
+  caregiverId   String?
+  status        String    @default("scheduled")
+  escalatedToId String?
+  scheduledAt   DateTime
+  createdAt     DateTime  @default(now())
+}
+
+model Event {
+  id        String    @id @default(cuid())
+  title     String
+  startAt   DateTime
+  endAt     DateTime?
+  type      String    @default("personal")
+  location  String?
+  ownerId   String?
+  note      String?
+  createdAt DateTime  @default(now())
+}
+
+model Bill {
+  id        String    @id @default(cuid())
+  title     String
+  category  String    @default("Other")
+  amount    Float
+  currency  String    @default("INR")
+  dueDate   DateTime
+  status    String    @default("due")
+  payerId   String?
+  recurring String?
+  paidAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model DocItem {
+  id         String   @id @default(cuid())
+  title      String
+  type       String   @default("other")
+  ownerName  String
+  sizeLabel  String   @default("—")
+  visibility String   @default("household")
+  createdAt  DateTime @default(now())
+}
+
+model InventoryItem {
+  id           String   @id @default(cuid())
+  name         String
+  quantity     Float    @default(0)
+  unit         String   @default("pcs")
+  category     String   @default("Other")
+  lowThreshold Float    @default(0)
+  updatedAt    DateTime @updatedAt
+}
+
+model Store {
+  id         String   @id @default(cuid())
+  name       String
+  category   String
+  distanceKm Float
+  etaMins    Int
+  rating     Float    @default(0)
+  reviews    Int      @default(0)
+  openNow    Boolean?
+  address    String
+  phone      String?
+}
+
+model AssistantMessage {
+  id           String   @id @default(cuid())
+  role         String
+  content      String
+  action       String?
+  actionStatus String?
+  createdAt    DateTime @default(now())
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  actor     String
+  action    String
+  target    String
+  createdAt DateTime @default(now())
+}
