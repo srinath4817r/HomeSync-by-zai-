@@ -9,6 +9,7 @@ import {
   CalendarOff,
   CalendarPlus,
   Clock,
+  CloudSun,
   Coffee,
   Compass,
   Drumstick,
@@ -18,6 +19,7 @@ import {
   Leaf,
   ListChecks,
   MapPin,
+  MapPinOff,
   MapPinned,
   Milk,
   Package,
@@ -25,6 +27,7 @@ import {
   Pill,
   Plus,
   ReceiptText,
+  RotateCcw,
   Satellite,
   Scissors,
   ShoppingBag,
@@ -33,6 +36,7 @@ import {
   SprayCan,
   Stethoscope,
   Store,
+  TriangleAlert,
   UsersRound,
   UtensilsCrossed,
   Wheat,
@@ -135,11 +139,20 @@ export function OverviewView() {
   const setView = useAppStore((s) => s.setView);
   const requestQuickAdd = useAppStore((s) => s.requestQuickAdd);
   const user = useSession((s) => s.user);
+  const family = useSession((s) => s.family);
   const writable = canWrite(user?.role);
   const [activePinId, setActivePinId] = useState<string | null>(null);
 
+  const homeLat = family?.homeLat ?? null;
+  const homeLng = family?.homeLng ?? null;
+  const hasHomeCoords = homeLat != null && homeLng != null;
+
   const dash = useResource<DashboardResponse>("/api/dashboard");
-  const weatherRes = useResource<WeatherData>("/api/weather");
+  // Weather is only fetched when the family has real home coordinates — without
+  // them we show an honest setup prompt instead of any made-up forecast.
+  const weatherRes = useResource<WeatherData>(
+    hasHomeCoords ? `/api/weather?lat=${homeLat}&lng=${homeLng}` : null
+  );
   const groceriesRes = useResource<GroceryItem[]>("/api/groceries");
   const storesRes = useResource<{ categories: { key: string; label: string; count: number }[]; stores: NearbyStore[] }>("/api/stores");
 
@@ -192,6 +205,10 @@ export function OverviewView() {
     : "";
 
   const homePlace = SAVED_PLACES.find((p) => p.id === "place-home");
+  const homeCenter: [number, number] =
+    homeLat != null && homeLng != null
+      ? [homeLat, homeLng]
+      : [homePlace?.lat ?? 13.0904, homePlace?.lng ?? 80.2119];
 
   type QuickAction = { label: string; icon: LucideIcon; onClick: () => void };
   const quickActions: QuickAction[] = [
@@ -259,9 +276,57 @@ export function OverviewView() {
             </div>
           </div>
 
-          {/* Weather widget */}
+          {/* Weather widget — real Open-Meteo data or honest states, never invented */}
           <GlassCard className="w-full max-w-sm shrink-0 p-4 glass-inset">
-            {!weatherRes.data ? (
+            {!hasHomeCoords ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-3">
+                  <span
+                    aria-hidden
+                    className="glass-inset flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-foreground/70"
+                  >
+                    <MapPinOff className="h-5 w-5" />
+                  </span>
+                  <div className="leading-tight">
+                    <p className="text-sm font-semibold">No home location yet</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Set your home location in Settings to see live weather.
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-fit rounded-xl"
+                  onClick={() => setView("settings")}
+                >
+                  <MapPin className="h-4 w-4" /> Open Settings
+                </Button>
+              </div>
+            ) : weatherRes.error ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-3">
+                  <span
+                    aria-hidden
+                    className="glass-inset flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-foreground/70"
+                  >
+                    <CloudSun className="h-5 w-5" />
+                  </span>
+                  <div className="leading-tight">
+                    <p className="text-sm font-semibold">Weather unavailable</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">{weatherRes.error}</p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-fit rounded-xl"
+                  onClick={() => void weatherRes.refresh()}
+                >
+                  <RotateCcw className="h-4 w-4" /> Retry
+                </Button>
+              </div>
+            ) : !weatherRes.data ? (
               <div className="flex items-center gap-3">
                 <span className="h-10 w-10 animate-pulse rounded-full bg-muted" />
                 <div className="space-y-1.5">
@@ -307,7 +372,7 @@ export function OverviewView() {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
         <GlassCard className="p-4 sm:p-5">
           <div className="flex flex-wrap items-start justify-between gap-2">
-            <SectionHeader icon={<UsersRound className="h-4 w-4" />} title="Your family" sub={`${members.length} members • ${homePlace?.sublabel ?? "Home"}`} />
+            <SectionHeader icon={<UsersRound className="h-4 w-4" />} title="Your family" sub={`${members.length} member${members.length === 1 ? "" : "s"} • ${family?.homeLabel ?? homePlace?.label ?? "Home"}`} />
           </div>
           <div className="scrollbar-slim mt-4 flex gap-4 overflow-x-auto pb-1 sm:gap-5">
             {members.map((m) => (
@@ -377,7 +442,7 @@ export function OverviewView() {
                 interactive={false}
                 mapStyle="satellite"
                 zoom={15}
-                center={[13.0904, 80.2119]}
+                center={homeCenter}
                 className="h-full w-full"
               />
             </div>
@@ -406,11 +471,11 @@ export function OverviewView() {
 
       {/* ============ STATS ============ */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
-        <StatTile icon={<CalendarDays className="h-4 w-4" />} label="Today's Events" value={stats?.todayEvents ?? "—"} sub={stats?.nextEventLabel ?? "Loading…"} onClick={() => setView("calendar")} />
-        <StatTile icon={<ListChecks className="h-4 w-4" />} label="Tasks" value={stats?.tasksPending ?? "—"} sub="pending now" onClick={() => setView("tasks")} />
-        <StatTile icon={<ShoppingBasket className="h-4 w-4" />} label="Grocery Items" value={stats?.groceryToBuy ?? "—"} sub="to buy" onClick={() => setView("groceries")} />
-        <StatTile icon={<Pill className="h-4 w-4" />} label="Medicine" value={stats?.medicinesToday ?? "—"} sub="doses today" onClick={() => setView("care")} />
-        <StatTile icon={<ReceiptText className="h-4 w-4" />} label="Bills Due" value={stats?.billsDue ?? "—"} sub="awaiting payment" onClick={() => setView("bills")} />
+        <StatTile icon={<CalendarDays className="h-4 w-4" />} label="Today's Events" value={stats?.todayEvents ?? "—"} sub={stats ? (stats.todayEvents === 0 ? "Nothing scheduled today" : stats.nextEventLabel) : "Loading…"} onClick={() => setView("calendar")} />
+        <StatTile icon={<ListChecks className="h-4 w-4" />} label="Tasks" value={stats?.tasksPending ?? "—"} sub={stats ? (stats.tasksPending === 0 ? "All caught up" : "pending now") : "Loading…"} onClick={() => setView("tasks")} />
+        <StatTile icon={<ShoppingBasket className="h-4 w-4" />} label="Grocery Items" value={stats?.groceryToBuy ?? "—"} sub={stats ? (stats.groceryToBuy === 0 ? "List is clear" : "to buy") : "Loading…"} onClick={() => setView("groceries")} />
+        <StatTile icon={<Pill className="h-4 w-4" />} label="Medicine" value={stats?.medicinesToday ?? "—"} sub={stats ? (stats.medicinesToday === 0 ? "No doses today" : "doses today") : "Loading…"} onClick={() => setView("care")} />
+        <StatTile icon={<ReceiptText className="h-4 w-4" />} label="Bills Due" value={stats?.billsDue ?? "—"} sub={stats ? (stats.billsDue === 0 ? "All paid up" : "awaiting payment") : "Loading…"} onClick={() => setView("bills")} />
         <StatTile
           icon={<MapPinned className="h-4 w-4" />}
           label="Family Check-In"
@@ -535,7 +600,28 @@ export function OverviewView() {
                 </Button>
               }
             />
-            {needed.length === 0 ? (
+            {groceriesRes.loading && !groceriesRes.data ? (
+              <div className="mt-3 space-y-2">
+                {[0, 1, 2].map((i) => (
+                  <div key={i} className="flex items-center gap-2.5 rounded-xl px-2 py-1.5">
+                    <span className="h-5 w-5 animate-pulse rounded-full bg-muted" />
+                    <span className="h-3.5 w-28 animate-pulse rounded bg-muted" />
+                  </div>
+                ))}
+              </div>
+            ) : groceriesRes.error ? (
+              <div className="mt-3">
+                <EmptyState title="Couldn't load the grocery list" sub={groceriesRes.error} icon={<TriangleAlert />} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-2 w-full rounded-xl"
+                  onClick={() => void groceriesRes.refresh()}
+                >
+                  <RotateCcw className="h-4 w-4" /> Try again
+                </Button>
+              </div>
+            ) : needed.length === 0 ? (
               <div className="mt-3">
                 <EmptyState title="All purchased!" sub="The grocery list is clear for now." icon={<CheckDraw size={44} />} />
               </div>
@@ -588,7 +674,31 @@ export function OverviewView() {
                 </Button>
               }
             />
-            {storesRes.data && topStores.length === 0 ? (
+            {storesRes.loading && !storesRes.data ? (
+              <ul className="mt-3 space-y-2">
+                {[0, 1, 2].map((i) => (
+                  <li key={i} className="glass-inset flex items-center gap-3 rounded-xl p-2.5">
+                    <span className="h-9 w-9 animate-pulse rounded-xl bg-muted" />
+                    <div className="flex-1 space-y-1.5">
+                      <span className="block h-3 w-24 animate-pulse rounded bg-muted" />
+                      <span className="block h-2.5 w-32 animate-pulse rounded bg-muted" />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : storesRes.error ? (
+              <div className="mt-3">
+                <EmptyState title="Couldn't load nearby places" sub={storesRes.error} icon={<TriangleAlert />} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-2 w-full rounded-xl"
+                  onClick={() => void storesRes.refresh()}
+                >
+                  <RotateCcw className="h-4 w-4" /> Try again
+                </Button>
+              </div>
+            ) : storesRes.data && topStores.length === 0 ? (
               <div className="mt-3">
                 <EmptyState title="No places found" sub="Try a wider radius in Nearby Services." icon={<RadarSweep />} />
               </div>
@@ -631,7 +741,7 @@ export function OverviewView() {
         />
         {activity.length === 0 ? (
           <div className="mt-3">
-            <EmptyState title="No activity yet" sub="Actions like completing tasks or paying bills will appear here." />
+            <EmptyState title="No activity yet" sub="Family activity will appear here." />
           </div>
         ) : (
           <ul className="scrollbar-slim mt-3 grid max-h-52 gap-1 overflow-y-auto pr-1 sm:grid-cols-2">

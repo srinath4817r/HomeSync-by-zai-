@@ -1,165 +1,154 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { familyMembers, logActivity, pickColor, serializeMember } from "@/lib/homesync/server";
+import { readJson } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
-const ADMIN_ERROR = "Family must keep at least one administrator";
+const ALLOWED_ROLES = new Set(["Family Admin", "Parent", "Senior Member", "Child", "Caregiver", "Member"]);
 
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  const body = await req.json().catch(() => null);
-  return body && typeof body === "object" && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : null;
+/** GET /api/members — household profiles of my family (with real last pings). */
+export async function GET(req: NextRequest) {
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  return NextResponse.json(await familyMembers(ctx.familyId));
 }
 
-/** GET /api/members — all members, oldest first. */
-export async function GET() {
-  try {
-    await ensureSeed();
-    const members = await db.member.findMany({ orderBy: { createdAt: "asc" } });
-    return NextResponse.json(members);
-  } catch (e) {
-    console.error("GET /api/members failed:", e);
-    return NextResponse.json({ error: "Failed to load members" }, { status: 500 });
-  }
-}
-
-/** POST /api/members — invite a new family member. */
+/**
+ * POST /api/members — add a household profile (e.g. a grandparent who does
+ * not use the app). Real user-entered data, scoped to the caller's family.
+ */
 export async function POST(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const name = typeof body.name === "string" ? body.name.trim() : "";
-    const relation = typeof body.relation === "string" ? body.relation.trim() : "";
-    if (!name) return NextResponse.json({ error: "name is required" }, { status: 400 });
-    if (!relation) return NextResponse.json({ error: "relation is required" }, { status: 400 });
+  const body = await readJson(req);
+  const name = String(body.name ?? "").trim().slice(0, 60);
+  const relation = String(body.relation ?? "").trim().slice(0, 30) || "Member";
+  const role = ALLOWED_ROLES.has(String(body.role)) ? String(body.role) : "Member";
+  if (!name) return NextResponse.json({ error: "Enter a name." }, { status: 400 });
 
-    const created = await db.member.create({
-      data: {
-        name,
-        relation,
-        role: typeof body.role === "string" && body.role.trim() ? body.role.trim() : "Member",
-        color: typeof body.color === "string" && body.color ? body.color : "#64748b",
-        isAdmin: body.isAdmin === true,
-        locationSharing: false,
-      },
-    });
-    return NextResponse.json(created, { status: 201 });
-  } catch (e) {
-    console.error("POST /api/members failed:", e);
-    return NextResponse.json({ error: "Failed to create member" }, { status: 500 });
+  const count = await db.member.count({ where: { familyId: ctx.familyId } });
+  const family = await db.family.findUnique({ where: { id: ctx.familyId } });
+  if (family && count >= family.capacity + 12) {
+    return NextResponse.json({ error: "Too many profiles for this household." }, { status: 403 });
   }
+
+  // Only an admin can create an ADMIN profile.
+  const isAdmin = body.isAdmin === true && ctx.isAdmin;
+  const member = await db.member.create({
+    data: {
+      familyId: ctx.familyId,
+      name,
+      relation,
+      role: isAdmin ? "Family Admin" : role,
+      color: pickColor(`${name}${relation}`),
+      isAdmin,
+      locationSharing: false,
+    },
+  });
+  await logActivity(ctx.familyId, ctx.user, "added family member", name);
+  return NextResponse.json({ member: serializeMember(member) });
 }
 
-/** PATCH /api/members — update partial member fields (id required). */
+/**
+ * PATCH /api/members — edit a household profile.
+ * Role / isAdmin changes are ADMIN-ONLY and enforced here.
+ */
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.member.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Member not found" }, { status: 404 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const member = await db.member.findUnique({ where: { id } });
+  if (!member || member.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Member not found." }, { status: 404 });
+  }
 
-    const data: Record<string, unknown> = {};
-    if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim();
-    if (typeof body.relation === "string" && body.relation.trim()) data.relation = body.relation.trim();
-    if (typeof body.role === "string" && body.role.trim()) data.role = body.role.trim();
-    if (typeof body.color === "string" && body.color) data.color = body.color;
-    if (typeof body.isAdmin === "boolean") data.isAdmin = body.isAdmin;
-    if (typeof body.locationSharing === "boolean") data.locationSharing = body.locationSharing;
-    if (body.locationLabel === null || typeof body.locationLabel === "string") {
-      data.locationLabel = body.locationLabel;
+  const data: Record<string, unknown> = {};
+  if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim().slice(0, 60);
+  if (typeof body.relation === "string" && body.relation.trim()) data.relation = body.relation.trim().slice(0, 30);
+  if (typeof body.role === "string" && ALLOWED_ROLES.has(body.role)) {
+    if (!ctx.isAdmin && body.role !== member.role) {
+      return NextResponse.json({ error: "Only the Family Admin can change roles." }, { status: 403 });
     }
-    if (body.locationUpdatedAt === null) {
-      data.locationUpdatedAt = null;
-    } else if (typeof body.locationUpdatedAt === "string") {
-      const d = new Date(body.locationUpdatedAt);
-      if (Number.isNaN(d.getTime())) {
-        return NextResponse.json(
-          { error: "locationUpdatedAt must be a valid ISO datetime" },
-          { status: 400 }
-        );
-      }
-      data.locationUpdatedAt = d;
+    data.role = body.role;
+    if (body.role === "Family Admin") data.isAdmin = true;
+  }
+  if (typeof body.isAdmin === "boolean") {
+    if (!ctx.isAdmin) {
+      return NextResponse.json({ error: "Only the Family Admin can change admin status." }, { status: 403 });
     }
+    data.isAdmin = body.isAdmin;
+    if (body.isAdmin) data.role = "Family Admin";
+  }
+  if (typeof body.locationSharing === "boolean") {
+    // Members may toggle their OWN sharing consent; admins may toggle anyone.
+    const isSelf = member.userId === ctx.user.id;
+    if (!isSelf && !ctx.isAdmin) {
+      return NextResponse.json({ error: "You can only change your own location sharing." }, { status: 403 });
+    }
+    data.locationSharing = body.locationSharing;
+  }
+  if (typeof body.placeLabel === "string") {
+    const isSelf = member.userId === ctx.user.id;
+    if (!isSelf && !ctx.isAdmin) {
+      return NextResponse.json({ error: "You can only change your own place label." }, { status: 403 });
+    }
+    data.placeLabel = body.placeLabel.trim().slice(0, 60) || null;
+  }
+  if (typeof body.photoUrl === "string" || body.photoUrl === null) {
+    const isSelf = member.userId === ctx.user.id;
+    if (!isSelf && !ctx.isAdmin) {
+      return NextResponse.json({ error: "You can only change your own photo." }, { status: 403 });
+    }
+    data.photoUrl = typeof body.photoUrl === "string" ? body.photoUrl.slice(0, 500) : null;
+  }
 
-    // Safety: never allow the last administrator to be demoted.
-    if (existing.isAdmin && data.isAdmin === false) {
-      const otherAdmins = await db.member.count({ where: { isAdmin: true, id: { not: id } } });
-      if (otherAdmins === 0) return NextResponse.json({ error: ADMIN_ERROR }, { status: 400 });
-    }
+  if (Object.keys(data).length === 0) {
+    return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
+  }
 
-    const updated = await db.member.update({ where: { id }, data });
+  const updated = await db.member.update({ where: { id }, data });
 
-    // When the admin edits a member's identity, lock that user's self-edit
-    // profile and mirror the changes onto their linked account.
-    const identityChanged =
-      (typeof data.name === "string" && data.name !== existing.name) ||
-      (typeof data.role === "string" && data.role !== existing.role);
-    if (identityChanged || body.lockProfile === true) {
-      const linkedUsers = await db.appUser.findMany({ where: { memberId: id } });
-      for (const u of linkedUsers) {
-        await db.appUser.update({
-          where: { id: u.id },
-          data: {
-            profileLocked: true,
-            ...(typeof data.name === "string" ? { name: data.name } : {}),
-            ...(typeof data.role === "string" ? { role: data.role } : {}),
-          },
-        });
-      }
-    }
-
-    const actor = req.headers.get("X-HS-Actor") ?? "Family Admin";
-    const logs: { actor: string; action: string; target: string }[] = [];
-    if (typeof data.role === "string" && data.role !== existing.role) {
-      logs.push({ actor, action: "updated role of", target: updated.name });
-    }
-    if (identityChanged) {
-      logs.push({ actor, action: "updated profile of", target: updated.name });
-    }
-    if (typeof data.locationSharing === "boolean" && data.locationSharing !== existing.locationSharing) {
-      logs.push({
-        actor,
-        action: data.locationSharing ? "resumed location sharing for" : "paused location sharing for",
-        target: updated.name,
+  // Keep the linked user's membership role in sync when an admin changed it.
+  if ((data.role || data.isAdmin !== undefined) && updated.userId) {
+    const membership = await db.membership.findFirst({
+      where: { userId: updated.userId, familyId: ctx.familyId },
+    });
+    if (membership) {
+      await db.membership.update({
+        where: { id: membership.id },
+        data: { role: (data.role as string) ?? membership.role },
       });
     }
-    if (logs.length > 0) await db.activityLog.createMany({ data: logs });
-
-    return NextResponse.json(updated);
-  } catch (e) {
-    console.error("PATCH /api/members failed:", e);
-    return NextResponse.json({ error: "Failed to update member" }, { status: 500 });
   }
+
+  return NextResponse.json({ member: serializeMember(updated) });
 }
 
-/** DELETE /api/members — remove a member by id (JSON body, searchParams fallback). */
+/** DELETE /api/members — remove a household profile (admin only). */
 export async function DELETE(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    const id =
-      (body && typeof body.id === "string" ? body.id : "") ||
-      req.nextUrl.searchParams.get("id") ||
-      "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const ctx = await requireFamily(req, { adminOnly: true });
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.member.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Member not found" }, { status: 404 });
-
-    if (existing.isAdmin) {
-      const otherAdmins = await db.member.count({ where: { isAdmin: true, id: { not: id } } });
-      if (otherAdmins === 0) return NextResponse.json({ error: ADMIN_ERROR }, { status: 400 });
-    }
-
-    await db.member.delete({ where: { id } });
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /api/members failed:", e);
-    return NextResponse.json({ error: "Failed to delete member" }, { status: 500 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const member = await db.member.findUnique({ where: { id } });
+  if (!member || member.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Member not found." }, { status: 404 });
   }
+  if (member.isAdmin) {
+    const adminProfiles = await db.member.count({ where: { familyId: ctx.familyId, isAdmin: true } });
+    if (adminProfiles <= 1) {
+      return NextResponse.json({ error: "There must always be one Family Admin." }, { status: 403 });
+    }
+  }
+  await db.medicine.deleteMany({ where: { memberId: id } });
+  await db.locationPing.deleteMany({ where: { memberId: id } });
+  await db.member.delete({ where: { id } });
+  await logActivity(ctx.familyId, ctx.user, "removed family member", member.name);
+  return NextResponse.json({ ok: true });
 }

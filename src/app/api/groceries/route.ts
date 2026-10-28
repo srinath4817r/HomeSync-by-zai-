@@ -1,127 +1,113 @@
 import { NextRequest, NextResponse } from "next/server";
-import type { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { logActivity } from "@/lib/homesync/server";
+import { readJson } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  const body = await req.json().catch(() => null);
-  return body && typeof body === "object" && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : null;
+function serialize(g: {
+  id: string; name: string; quantity: string; category: string; status: string;
+  priority: string; note: string | null; assigneeId: string | null;
+  purchasedAt: Date | null; createdAt: Date;
+}) {
+  return {
+    id: g.id,
+    name: g.name,
+    quantity: g.quantity,
+    category: g.category,
+    status: g.status,
+    priority: g.priority,
+    note: g.note,
+    assigneeId: g.assigneeId,
+    purchasedAt: g.purchasedAt?.toISOString() ?? null,
+    createdAt: g.createdAt.toISOString(),
+  };
 }
 
-/** Apply partial grocery fields from a request body. */
-function groceryFields(body: Record<string, unknown>): Prisma.GroceryItemUpdateInput {
-  const data: Prisma.GroceryItemUpdateInput = {};
-  if (body.name !== undefined) {
-    if (typeof body.name !== "string" || !body.name.trim()) return data;
-    data.name = body.name.trim();
-  }
-  if (typeof body.quantity === "string") data.quantity = body.quantity;
-  if (typeof body.category === "string" && body.category) data.category = body.category;
-  if (typeof body.status === "string" && body.status) data.status = body.status;
-  if (typeof body.priority === "string" && body.priority) data.priority = body.priority;
-  if (typeof body.note === "string" || body.note === null) data.note = body.note;
-  if (body.assigneeId === null || typeof body.assigneeId === "string") data.assigneeId = body.assigneeId;
-  if (typeof body.visibility === "string" && body.visibility) data.visibility = body.visibility;
-  return data;
-}
-
-/** GET /api/groceries?status=&category= — ordered by createdAt asc. */
+/** GET /api/groceries — my family's shared grocery list. */
 export async function GET(req: NextRequest) {
-  try {
-    await ensureSeed();
-    const where: { status?: string; category?: string } = {};
-    const status = req.nextUrl.searchParams.get("status");
-    const category = req.nextUrl.searchParams.get("category");
-    if (status) where.status = status;
-    if (category) where.category = category;
-
-    const groceries = await db.groceryItem.findMany({ where, orderBy: { createdAt: "asc" } });
-    return NextResponse.json(groceries);
-  } catch (e) {
-    console.error("GET /api/groceries failed:", e);
-    return NextResponse.json({ error: "Failed to load groceries" }, { status: 500 });
-  }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const items = await db.groceryItem.findMany({
+    where: { familyId: ctx.familyId },
+    orderBy: { createdAt: "asc" },
+    take: 500,
+  });
+  return NextResponse.json(items.map(serialize));
 }
 
-/** POST /api/groceries — add a grocery item. */
+/** POST /api/groceries — add an item (addedBy attributed from session). */
 export async function POST(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    if (typeof body.name !== "string" || !body.name.trim()) {
-      return NextResponse.json({ error: "name is required" }, { status: 400 });
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const created = await db.groceryItem.create({
-      data: {
-        name: body.name.trim(),
-        quantity: typeof body.quantity === "string" ? body.quantity : "",
-        category: typeof body.category === "string" && body.category ? body.category : "Other",
-        priority: typeof body.priority === "string" && body.priority ? body.priority : "medium",
-        assigneeId: typeof body.assigneeId === "string" ? body.assigneeId : null,
-        note: typeof body.note === "string" ? body.note : null,
-        visibility: typeof body.visibility === "string" && body.visibility ? body.visibility : "household",
-      },
-    });
-    return NextResponse.json(created, { status: 201 });
-  } catch (e) {
-    console.error("POST /api/groceries failed:", e);
-    return NextResponse.json({ error: "Failed to create grocery item" }, { status: 500 });
-  }
+  const body = await readJson(req);
+  const name = String(body.name ?? "").trim().slice(0, 80);
+  if (!name) return NextResponse.json({ error: "Enter an item name." }, { status: 400 });
+
+  const item = await db.groceryItem.create({
+    data: {
+      familyId: ctx.familyId,
+      name,
+      quantity: typeof body.quantity === "string" ? body.quantity.trim().slice(0, 30) : "",
+      category: typeof body.category === "string" && body.category ? body.category.slice(0, 30) : "Other",
+      priority: ["low", "medium", "high"].includes(String(body.priority)) ? String(body.priority) : "medium",
+      note: typeof body.note === "string" && body.note.trim() ? body.note.trim().slice(0, 200) : null,
+      assigneeId: typeof body.assigneeId === "string" && body.assigneeId ? body.assigneeId : null,
+      addedById: ctx.user.id,
+    },
+  });
+  await logActivity(ctx.familyId, ctx.user, "added to groceries", name);
+  return NextResponse.json({ grocery: serialize(item) });
 }
 
-/** PATCH /api/groceries — update partial fields; logs activity when purchased. */
+/** PATCH /api/groceries — edit / check off / reopen. Purchases recorded server-side. */
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.groceryItem.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Grocery item not found" }, { status: 404 });
-
-    const data = groceryFields(body);
-    const updated = await db.groceryItem.update({ where: { id }, data });
-
-    if (data.status === "purchased" && existing.status !== "purchased") {
-      await db.activityLog.create({
-        data: {
-          actor: req.headers.get("X-HS-Actor") ?? "Family",
-          action: "purchased",
-          target: `${updated.name} ${updated.quantity}`.trim(),
-        },
-      });
-    }
-
-    return NextResponse.json(updated);
-  } catch (e) {
-    console.error("PATCH /api/groceries failed:", e);
-    return NextResponse.json({ error: "Failed to update grocery item" }, { status: 500 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const item = await db.groceryItem.findUnique({ where: { id } });
+  if (!item || item.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Item not found." }, { status: 404 });
   }
+
+  const data: Record<string, unknown> = {};
+  if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim().slice(0, 80);
+  if (typeof body.quantity === "string") data.quantity = body.quantity.trim().slice(0, 30);
+  if (typeof body.category === "string" && body.category) data.category = body.category.slice(0, 30);
+  if (["low", "medium", "high"].includes(String(body.priority))) data.priority = body.priority;
+  if (typeof body.note === "string") data.note = body.note.trim().slice(0, 200) || null;
+  if (body.assigneeId === null || typeof body.assigneeId === "string") {
+    data.assigneeId = body.assigneeId || null;
+  }
+  if (["needed", "purchased", "skipped"].includes(String(body.status))) {
+    data.status = body.status;
+    data.purchasedAt = body.status === "purchased" ? new Date() : null;
+  }
+  if (Object.keys(data).length === 0) {
+    return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
+  }
+
+  const updated = await db.groceryItem.update({ where: { id }, data });
+  if (data.status === "purchased") {
+    await logActivity(ctx.familyId, ctx.user, "purchased", updated.name);
+  }
+  return NextResponse.json({ grocery: serialize(updated) });
 }
 
-/** DELETE /api/groceries — remove an item by id (JSON body, searchParams fallback). */
+/** DELETE /api/groceries */
 export async function DELETE(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    const id =
-      (body && typeof body.id === "string" ? body.id : "") ||
-      req.nextUrl.searchParams.get("id") ||
-      "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
-
-    const existing = await db.groceryItem.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Grocery item not found" }, { status: 404 });
-
-    await db.groceryItem.delete({ where: { id } });
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /api/groceries failed:", e);
-    return NextResponse.json({ error: "Failed to delete grocery item" }, { status: 500 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const item = await db.groceryItem.findUnique({ where: { id } });
+  if (!item || item.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Item not found." }, { status: 404 });
   }
+  await db.groceryItem.delete({ where: { id } });
+  return NextResponse.json({ ok: true });
 }

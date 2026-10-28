@@ -2,22 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Copy,
   CheckCircle2,
-  Eye,
-  EyeOff,
+  Copy,
   ExternalLink,
   KeyRound,
   Loader2,
-  LockKeyhole,
-  LogIn,
-  Mail,
-  UsersRound,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Dialog,
   DialogContent,
@@ -25,79 +17,26 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { GlassCard, MemberAvatar } from "@/components/homesync/glass";
+import { GlassCard } from "@/components/homesync/glass";
 import {
   GoogleIcon,
   HomeSyncMark,
-  ShieldUserIcon,
   SparkleFloat,
 } from "@/components/homesync/icons";
 import { useSession } from "@/lib/homesync/session";
-import type { SessionUser } from "@/lib/homesync/types";
-import { cn } from "@/lib/utils";
 
 /**
- * Liquid glass sign-in.
- * Family accounts sign in with one tap; Google continues through the REAL
- * Google OAuth consent screen (authorization-code flow, verified by the
- * server); Guest gets a read-only preview.
+ * Liquid glass sign-in — REAL Google OAuth only.
+ * Guest mode, demo accounts and password sign-in were removed:
+ * every household member signs in with their own verified Google account.
  */
-
-const FAMILY_ACCOUNTS = [
-  { name: "Karthik Rao", role: "Family Admin", email: "karthik@homesync.app", color: "#64748b" },
-  { name: "Meera Rao", role: "Parent", email: "meera@homesync.app", color: "#8f7a99" },
-  { name: "Aditya Rao", role: "Child", email: "aditya@homesync.app", color: "#6f9a80" },
-  { name: "Ramesh Rao", role: "Senior Member", email: "ramesh@homesync.app", color: "#6889a8" },
-];
-
-/** Shared family password — used only by the one-tap sign-in chips, never shown in the UI. */
-const FAMILY_PASSWORD = "home@123";
 
 const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const OAUTH_STATE_KEY = "homesync-oauth-state";
 
-type AuthResult = { user: SessionUser | null; error: string | null };
-
-/** POST an auth endpoint and normalize the result (never throws). */
-async function requestUser(
-  url: string,
-  body: Record<string, unknown>,
-  fallbackError: string
-): Promise<AuthResult> {
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = (await res.json().catch(() => ({}))) as {
-      user?: SessionUser;
-      error?: string;
-    };
-    if (!res.ok || !data.user) {
-      return { user: null, error: data.error ?? fallbackError };
-    }
-    return { user: data.user, error: null };
-  } catch {
-    return { user: null, error: "Could not reach the home server. Please try again." };
-  }
-}
-
 export function LoginScreen() {
-  const login = useSession((s) => s.login);
-  const loginGuest = useSession((s) => s.loginGuest);
+  const applyAuth = useSession((s) => s.applyAuth);
 
-  // Email + password form
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPw, setShowPw] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // One-tap family sign-in chips
-  const [chipBusy, setChipBusy] = useState<string | null>(null);
-
-  // Real Google OAuth
   const [googleBusy, setGoogleBusy] = useState(false);
   const [googleError, setGoogleError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -105,59 +44,6 @@ export function LoginScreen() {
   const [copied, setCopied] = useState(false);
   /** Guards the redirect-handling effect against double runs (React strict mode). */
   const oauthHandled = useRef(false);
-
-  async function signIn(e?: React.FormEvent) {
-    e?.preventDefault();
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const { user, error: authError } = await requestUser(
-        "/api/auth/login",
-        { email, password },
-        "Sign-in failed. Please try again."
-      );
-      if (authError || !user) {
-        setError(authError ?? "Sign-in failed. Please try again.");
-        return;
-      }
-      toast.success(`Welcome home, ${user.name}`);
-      login(user);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function quickSignIn(acc: (typeof FAMILY_ACCOUNTS)[number]) {
-    if (chipBusy) return;
-    setChipBusy(acc.email);
-    setError(null);
-    try {
-      const { user, error: authError } = await requestUser(
-        "/api/auth/login",
-        { email: acc.email, password: FAMILY_PASSWORD },
-        "Sign-in failed. Please try again."
-      );
-      if (authError || !user) {
-        toast.error(authError ?? "Sign-in failed. Please try again.");
-        return;
-      }
-      toast.success(`Welcome home, ${user.name}`);
-      login(user);
-    } finally {
-      setChipBusy(null);
-    }
-  }
-
-  /* ------------------- REAL Google OAuth (authorization code) ------------------- */
-
-  const finishSignIn = useCallback(
-    (user: SessionUser) => {
-      toast.success(`Welcome home, ${user.name}`);
-      login(user);
-    },
-    [login]
-  );
 
   /** Start the real flow: send the browser to Google's consent screen. */
   async function startGoogleSignIn() {
@@ -171,7 +57,6 @@ export function LoginScreen() {
         clientId?: string | null;
       };
       if (!config.configured || !config.clientId) {
-        // Keys are not set yet — show the owner's setup guide.
         setSetupRedirectUri(`${window.location.origin}/`);
         setSetupOpen(true);
         return;
@@ -222,7 +107,7 @@ export function LoginScreen() {
     if (!code && !oauthError) return;
     oauthHandled.current = true;
 
-    // Clean the address bar immediately (code is single-use and should not linger).
+    // Clean the address bar immediately (the code is single-use).
     window.history.replaceState({}, "", window.location.pathname);
 
     if (oauthError === "access_denied") {
@@ -249,21 +134,32 @@ export function LoginScreen() {
 
     setGoogleBusy(true);
     void (async () => {
-      const { user, error: authError } = await requestUser(
-        "/api/auth/google",
-        { code, redirectUri: `${window.location.origin}/` },
-        "Google sign-in failed. Please try again."
-      );
-      setGoogleBusy(false);
-      if (authError || !user) {
-        setGoogleError(authError ?? "Google sign-in failed. Please try again.");
-        return;
+      try {
+        const res = await fetch("/api/auth/google", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code, redirectUri: `${window.location.origin}/` }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          user?: { id: string; name: string; email: string; photoUrl: string | null };
+          membership?: { role: string; status: string; familyId: string } | null;
+          error?: string;
+        };
+        if (!res.ok || !data.user) {
+          setGoogleError(data.error ?? "Google sign-in failed. Please try again.");
+          return;
+        }
+        toast.success(`Welcome home, ${data.user.name}`);
+        applyAuth({ user: data.user, membership: data.membership ?? null });
+      } catch {
+        setGoogleError("Could not reach the home server. Please try again.");
+      } finally {
+        setGoogleBusy(false);
       }
-      finishSignIn(user);
     })();
-  }, [finishSignIn]);
+  }, [applyAuth]);
 
-  function copyRedirectUri() {
+  const copyRedirectUri = useCallback(() => {
     if (!setupRedirectUri) return;
     void navigator.clipboard
       .writeText(setupRedirectUri)
@@ -273,12 +169,7 @@ export function LoginScreen() {
         window.setTimeout(() => setCopied(false), 1600);
       })
       .catch(() => toast.error("Could not copy — long-press to copy manually"));
-  }
-
-  function enterGuest() {
-    toast("Continuing as Guest — read-only preview");
-    loginGuest();
-  }
+  }, [setupRedirectUri]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-10">
@@ -297,14 +188,14 @@ export function LoginScreen() {
             <span className="text-gradient">One Family.</span>
           </h1>
           <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-            Sign in to your family&apos;s private space — calendar, tasks, groceries, care, a live
-            satellite family map and an assistant that keeps the whole home in sync.
+            Your family&apos;s private space — calendar, tasks, groceries, care, a live
+            family map and an assistant that keeps the whole home in sync.
           </p>
           <ul className="space-y-2.5 text-sm">
             {[
-              "Consent-based live family location on real satellite maps",
+              "Consent-based live family location on real maps",
               "Everyone sees their own view — admin, parent, senior or kid",
-              "Guest mode available for a quick look around",
+              "Your household data stays private and permissive by role",
             ].map((t) => (
               <li key={t} className="flex items-start gap-2.5 text-muted-foreground">
                 <SparkleFloat className="mt-0.5 shrink-0 text-primary" size={18} />
@@ -326,77 +217,17 @@ export function LoginScreen() {
 
           <h2 className="text-xl font-bold tracking-tight">Welcome home</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Sign in with your family account, or take the guest path.
+            Sign in with your Google account — every family member uses their own.
           </p>
 
-          <form onSubmit={signIn} className="mt-5 space-y-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="login-email">Email</Label>
-              <div className="relative">
-                <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="login-email"
-                  type="email"
-                  autoComplete="email"
-                  placeholder="you@homesync.app"
-                  className="h-11 rounded-xl bg-background/50 pl-9"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  required
-                />
-              </div>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="login-password">Password</Label>
-              <div className="relative">
-                <LockKeyhole className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="login-password"
-                  type={showPw ? "text" : "password"}
-                  autoComplete="current-password"
-                  placeholder="Your password"
-                  className="h-11 rounded-xl bg-background/50 pl-9 pr-10"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPw((v) => !v)}
-                  aria-label={showPw ? "Hide password" : "Show password"}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                >
-                  {showPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-            </div>
-
-            {error ? (
-              <p role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-600 dark:text-red-400">
-                {error}
-              </p>
-            ) : null}
-
-            <Button type="submit" disabled={busy} className="brand-gradient h-11 w-full rounded-xl text-white shadow-md">
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-              {busy ? "Opening your home…" : "Sign in"}
-            </Button>
-          </form>
-
-          <div className="my-5 flex items-center gap-3">
-            <span className="h-px flex-1 bg-border" />
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">or</span>
-            <span className="h-px flex-1 bg-border" />
-          </div>
-
-          <div className="space-y-2">
+          <div className="mt-6 space-y-3">
             <Button
               type="button"
               variant="outline"
               onClick={() => void startGoogleSignIn()}
               disabled={googleBusy}
               aria-busy={googleBusy}
-              className="h-11 w-full rounded-xl"
+              className="h-12 w-full rounded-xl"
             >
               {googleBusy ? (
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -405,16 +236,10 @@ export function LoginScreen() {
               )}
               {googleBusy ? "Talking to Google…" : "Continue with Google"}
             </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={enterGuest}
-              className="h-11 w-full rounded-xl border-primary/40 text-primary hover:bg-primary/10"
-            >
-              <ShieldUserIcon size={18} />
-              Continue as Guest
-              <span className="ml-1 text-[10px] font-medium text-muted-foreground">(read-only preview)</span>
-            </Button>
+            <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+              Secured by Google. We only see your name, email and profile photo.
+              New here? You&apos;ll create your home or join with an invite code right after.
+            </p>
           </div>
 
           {googleError ? (
@@ -422,58 +247,10 @@ export function LoginScreen() {
               {googleError}
             </p>
           ) : null}
-
-          {/* Family accounts — one tap to sign in */}
-          <div className="mt-6">
-            <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              <UsersRound className="h-3 w-3 text-primary" /> Family accounts
-            </p>
-            <p className="mb-2.5 text-[11px] text-muted-foreground">Tap your name to sign in instantly</p>
-            <div className="grid grid-cols-2 gap-2">
-              {FAMILY_ACCOUNTS.map((acc) => {
-                const rowBusy = chipBusy === acc.email;
-                return (
-                  <button
-                    key={acc.email}
-                    type="button"
-                    onClick={() => void quickSignIn(acc)}
-                    disabled={Boolean(chipBusy)}
-                    aria-busy={rowBusy}
-                    title={`Sign in as ${acc.name}`}
-                    className={cn(
-                      "group flex items-center gap-2.5 rounded-xl border border-white/40 p-2.5 text-left transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:bg-primary/5 disabled:cursor-wait disabled:opacity-60 dark:border-white/10"
-                    )}
-                  >
-                    {rowBusy ? (
-                      <span className="flex h-[34px] w-[34px] shrink-0 items-center justify-center">
-                        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                      </span>
-                    ) : (
-                      <MemberAvatar name={acc.name} color={acc.color} role={acc.role} size={34} />
-                    )}
-                    <span className="min-w-0 leading-tight">
-                      <span className="block truncate text-xs font-semibold">{acc.name}</span>
-                      <span className="block truncate text-[10px] text-muted-foreground">{acc.role}</span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setSetupRedirectUri(`${window.location.origin}/`);
-                setSetupOpen(true);
-              }}
-              className="mx-auto mt-3 block text-[10px] font-medium text-muted-foreground/60 underline-offset-2 transition-colors hover:text-foreground hover:underline"
-            >
-              Google sign-in setup
-            </button>
-          </div>
         </GlassCard>
       </div>
 
-      {/* Google setup guide — shown only when the server keys are missing */}
+      {/* Google setup guide — shown when the server keys are missing */}
       <Dialog open={setupOpen} onOpenChange={setSetupOpen}>
         <DialogContent className="glass-strong max-w-md gap-3 rounded-2xl p-6">
           <DialogHeader>

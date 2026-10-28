@@ -17,14 +17,18 @@ export type ViewKey =
 
 export interface Member {
   id: string;
+  familyId?: string;
   name: string;
-  relation: string; // "Me", "Wife", "Son", "Daughter", "Dad", "Mom"
-  role: string; // "Family Admin", "Parent", "Senior Member", "Child", ...
+  relation: string; // "Me", "Wife", "Son", "Daughter", "Dad", "Mom", "Member", ...
+  role: string; // "Family Admin", "Parent", "Senior Member", "Child", "Caregiver", "Member"
   color: string; // hex for avatar background
   isAdmin: boolean;
   locationSharing: boolean;
-  locationLabel: string | null; // "Office • T. Nagar"
-  locationUpdatedAt: string | null; // ISO
+  locationLabel: string | null; // manual place label, e.g. "Office" (set by the member)
+  locationUpdatedAt: string | null; // last REAL GPS ping (ISO)
+  photoUrl?: string | null;
+  userId?: string | null;
+  lastPing?: { lat: number; lng: number; accuracyM: number | null; capturedAt: string; receivedAt: string } | null;
   createdAt: string;
 }
 
@@ -233,17 +237,60 @@ export interface SavedPlace {
   lng: number;
 }
 
-/** Signed-in session user (from login API, Google sign-in, or guest mode). */
+/**
+ * Signed-in user — ALWAYS hydrated from GET /api/auth/me (server session).
+ * The client store is only a cache; changing it locally grants nothing.
+ */
 export interface SessionUser {
   id: string;
   name: string;
-  email: string | null; // null for guest
-  role: string; // "Family Admin" | "Parent" | "Senior Member" | "Child" | "Guest"
-  relation: string; // "Me" | "Wife" | ... | "Guest"
-  color: string;
+  email: string | null;
   photoUrl: string | null; // real Google profile photo when available
-  memberId: string | null;
-  isGuest: boolean;
-  provider: string; // "local" | "google" | "guest"
-  profileLocked: boolean; // true once the Family Admin has edited this profile
+  role: string; // membership role: "Family Admin" | "Parent" | "Senior Member" | "Child" | "Caregiver" | "Member" | "None"
+  relation: string; // household relation label
+  color: string;
+  memberId: string | null; // linked household profile
+  familyId: string | null;
+  status: "active" | "pending" | "none"; // membership status
+  isGuest: false; // guests were removed — kept for view compatibility
+  provider: "google" | "none";
+  profileLocked: false;
+}
+
+/** The caller's family (server-verified). */
+export interface FamilyInfo {
+  id: string;
+  name: string;
+  homeLabel: string | null;
+  homeLat: number | null;
+  homeLng: number | null;
+  capacity: number;
+  timezone: string;
+}
+
+/** Pending join request (admin view). */
+export interface JoinRequest {
+  id: string;
+  createdAt: string;
+  user: { id: string; name: string; email: string; photoUrl: string | null };
+}
+
+/** Invite code (admin view). */
+export interface InviteInfo {
+  id: string;
+  code: string;
+  expiresAt: string;
+  revokedAt: string | null;
+  createdAt: string;
+  expired: boolean;
+}
+
+/** In-app notification. */
+export interface AppNotification {
+  id: string;
+  title: string;
+  body: string;
+  link: string | null;
+  read: boolean;
+  createdAt: string;
 }

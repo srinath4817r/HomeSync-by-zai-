@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Check,
   CheckCheck,
+  CircleAlert,
   ListChecks,
   ReceiptText,
   Send,
@@ -185,6 +186,9 @@ function Bubble({
   const isUser = message.role === "user";
   const content = isUser ? message.content : cleanContent(message.content);
   const hasActions = !isUser && message.actions.some((a) => a.kind !== "none");
+  // An assistant row with no surviving prose and no actions renders an honest
+  // placeholder instead of an invisible message.
+  const isEmptyAssistant = !isUser && !content && !hasActions;
   return (
     <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
       <div className={cn("flex max-w-[85%] flex-col sm:max-w-[72%]", isUser && "items-end")}>
@@ -197,6 +201,8 @@ function Bubble({
           >
             {content}
           </div>
+        ) : isEmptyAssistant ? (
+          <p className="text-xs italic text-muted-foreground">The assistant sent an empty reply.</p>
         ) : null}
         {hasActions ? (
           <BatchProposalCard message={message} pending={pending} writable={writable} onAction={onAction} />
@@ -215,6 +221,8 @@ export function AssistantView() {
   const writable = canWrite(user?.role);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [lastSent, setLastSent] = useState<string | null>(null);
   const [pendingActionId, setPendingActionId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -224,20 +232,24 @@ export function AssistantView() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, sending]);
+  }, [messages.length, sending, sendError]);
 
   async function send(text?: string) {
     const message = (text ?? input).trim();
     if (!message || sending) return;
     setSending(true);
+    setSendError(null);
+    setLastSent(message);
     try {
       await apiSend("/api/assistant", "POST", { message });
       setInput("");
+      setLastSent(null);
       await refresh();
     } catch (e) {
-      // Keep the user's text so they can retry without retyping.
+      // Surface the server's own message inline as an error bubble; keep the
+      // failed text in the input so the user can edit or retry it.
       setInput(message);
-      toast.error(e instanceof Error ? e.message : "Could not reach the assistant");
+      setSendError(e instanceof Error ? e.message : "Could not reach the assistant");
     } finally {
       setSending(false);
     }
@@ -305,7 +317,7 @@ export function AssistantView() {
         </div>
 
         {/* Messages */}
-        <div ref={scrollRef} className="scrollbar-slim flex-1 space-y-3 overflow-y-auto px-4 py-4">
+        <div ref={scrollRef} aria-live="polite" className="scrollbar-slim flex-1 space-y-3 overflow-y-auto px-4 py-4">
           {messages.length === 0 ? (
             <EmptyState
               icon={<SparkleFloat className="text-primary" />}
@@ -325,6 +337,43 @@ export function AssistantView() {
           )}
           {sending ? <TypingBubble /> : null}
         </div>
+
+        {/* Inline delivery-failure bubble — the server's message, never invented */}
+        {sendError ? (
+          <div className="px-4 pb-2">
+            <div
+              role="alert"
+              className="flex items-start gap-2.5 rounded-2xl border border-red-500/30 bg-red-500/10 px-3.5 py-3"
+            >
+              <CircleAlert aria-hidden className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-semibold text-red-600 dark:text-red-400">Message not delivered</p>
+                <p className="mt-0.5 break-words text-xs leading-relaxed text-red-700/90 dark:text-red-300/90">
+                  {sendError}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 border-red-500/40 px-2.5 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+                  disabled={sending || !lastSent}
+                  onClick={() => void send(lastSent ?? undefined)}
+                >
+                  Retry
+                </Button>
+                <button
+                  type="button"
+                  aria-label="Dismiss error"
+                  className="rounded-md p-1 text-red-600/70 transition-colors hover:bg-red-500/10 hover:text-red-600 dark:text-red-400/70"
+                  onClick={() => setSendError(null)}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {/* Suggested prompts (first-run only) */}
         {messages.length <= 1 ? (

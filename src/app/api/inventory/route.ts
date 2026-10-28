@@ -1,106 +1,96 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { readJson } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  const body = await req.json().catch(() => null);
-  return body && typeof body === "object" && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : null;
+function serialize(i: {
+  id: string; name: string; quantity: number; unit: string; category: string;
+  lowThreshold: number; updatedAt: Date;
+}) {
+  return {
+    id: i.id,
+    name: i.name,
+    quantity: i.quantity,
+    unit: i.unit,
+    category: i.category,
+    lowThreshold: i.lowThreshold,
+    updatedAt: i.updatedAt.toISOString(),
+  };
 }
 
-/** GET /api/inventory — items ordered by name asc. */
-export async function GET() {
-  try {
-    await ensureSeed();
-    const items = await db.inventoryItem.findMany({ orderBy: { name: "asc" } });
-    return NextResponse.json(items);
-  } catch (e) {
-    console.error("GET /api/inventory failed:", e);
-    return NextResponse.json({ error: "Failed to load inventory" }, { status: 500 });
-  }
+/** GET /api/inventory — my family's home inventory. */
+export async function GET(req: NextRequest) {
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const items = await db.inventoryItem.findMany({
+    where: { familyId: ctx.familyId },
+    orderBy: { updatedAt: "desc" },
+    take: 300,
+  });
+  return NextResponse.json(items.map(serialize));
 }
 
-/** POST /api/inventory — add an inventory item. */
+/** POST /api/inventory */
 export async function POST(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    if (typeof body.name !== "string" || !body.name.trim()) {
-      return NextResponse.json({ error: "name is required" }, { status: 400 });
-    }
-    if (typeof body.quantity !== "number" || !Number.isFinite(body.quantity)) {
-      return NextResponse.json({ error: "quantity must be a number" }, { status: 400 });
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const created = await db.inventoryItem.create({
-      data: {
-        name: body.name.trim(),
-        quantity: Math.max(0, body.quantity),
-        unit: typeof body.unit === "string" && body.unit ? body.unit : "pcs",
-        category: typeof body.category === "string" && body.category ? body.category : "Other",
-        lowThreshold:
-          typeof body.lowThreshold === "number" && Number.isFinite(body.lowThreshold)
-            ? Math.max(0, body.lowThreshold)
-            : 0,
-      },
-    });
-    return NextResponse.json(created, { status: 201 });
-  } catch (e) {
-    console.error("POST /api/inventory failed:", e);
-    return NextResponse.json({ error: "Failed to create inventory item" }, { status: 500 });
-  }
+  const body = await readJson(req);
+  const name = String(body.name ?? "").trim().slice(0, 80);
+  if (!name) return NextResponse.json({ error: "Enter an item name." }, { status: 400 });
+  const quantity = Number(body.quantity);
+  const lowThreshold = Number(body.lowThreshold);
+
+  const item = await db.inventoryItem.create({
+    data: {
+      familyId: ctx.familyId,
+      name,
+      quantity: Number.isFinite(quantity) ? Math.max(quantity, 0) : 0,
+      unit: typeof body.unit === "string" && body.unit ? body.unit.slice(0, 12) : "pcs",
+      category: typeof body.category === "string" && body.category ? body.category.slice(0, 30) : "Other",
+      lowThreshold: Number.isFinite(lowThreshold) ? Math.max(lowThreshold, 0) : 0,
+    },
+  });
+  return NextResponse.json({ item: serialize(item) });
 }
 
-/** PATCH /api/inventory — update partial fields (quantity clamped to >= 0). */
+/** PATCH /api/inventory */
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.inventoryItem.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Inventory item not found" }, { status: 404 });
-
-    const data: { name?: string; quantity?: number; unit?: string; category?: string; lowThreshold?: number } = {};
-    if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim();
-    if (typeof body.quantity === "number" && Number.isFinite(body.quantity)) {
-      data.quantity = Math.max(0, body.quantity);
-    }
-    if (typeof body.unit === "string" && body.unit) data.unit = body.unit;
-    if (typeof body.category === "string" && body.category) data.category = body.category;
-    if (typeof body.lowThreshold === "number" && Number.isFinite(body.lowThreshold)) {
-      data.lowThreshold = Math.max(0, body.lowThreshold);
-    }
-
-    const updated = await db.inventoryItem.update({ where: { id }, data });
-    return NextResponse.json(updated);
-  } catch (e) {
-    console.error("PATCH /api/inventory failed:", e);
-    return NextResponse.json({ error: "Failed to update inventory item" }, { status: 500 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const item = await db.inventoryItem.findUnique({ where: { id } });
+  if (!item || item.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Item not found." }, { status: 404 });
   }
+
+  const data: Record<string, unknown> = {};
+  if (typeof body.name === "string" && body.name.trim()) data.name = body.name.trim().slice(0, 80);
+  if (Number.isFinite(Number(body.quantity))) data.quantity = Math.max(Number(body.quantity), 0);
+  if (typeof body.unit === "string" && body.unit) data.unit = body.unit.slice(0, 12);
+  if (typeof body.category === "string" && body.category) data.category = body.category.slice(0, 30);
+  if (Number.isFinite(Number(body.lowThreshold))) data.lowThreshold = Math.max(Number(body.lowThreshold), 0);
+  if (Object.keys(data).length === 0) {
+    return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
+  }
+  const updated = await db.inventoryItem.update({ where: { id }, data });
+  return NextResponse.json({ item: serialize(updated) });
 }
 
-/** DELETE /api/inventory — remove an item by id (JSON body, searchParams fallback). */
+/** DELETE /api/inventory */
 export async function DELETE(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    const id =
-      (body && typeof body.id === "string" ? body.id : "") ||
-      req.nextUrl.searchParams.get("id") ||
-      "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
-
-    const existing = await db.inventoryItem.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Inventory item not found" }, { status: 404 });
-
-    await db.inventoryItem.delete({ where: { id } });
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /api/inventory failed:", e);
-    return NextResponse.json({ error: "Failed to delete inventory item" }, { status: 500 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const item = await db.inventoryItem.findUnique({ where: { id } });
+  if (!item || item.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Item not found." }, { status: 404 });
   }
+  await db.inventoryItem.delete({ where: { id } });
+  return NextResponse.json({ ok: true });
 }

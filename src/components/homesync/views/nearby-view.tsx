@@ -1,34 +1,35 @@
 "use client";
 
-import dynamic from "next/dynamic";
+/**
+ * Nearby Services — REAL place search.
+ *
+ * Results come from GET /api/nearby (server-side web search around a real
+ * place name resolved from the family home coordinates). Only fields the
+ * search genuinely returned are rendered: name, snippet, link. Distances,
+ * ratings, reviews and opening hours are NOT available from web results, so
+ * they are never shown — nothing is fabricated here.
+ */
+
 import { useEffect, useMemo, useState } from "react";
 import {
-  Building2,
   Coffee,
   Compass,
-  Footprints,
-  Globe,
-  Hand,
-  House,
-  MapPin,
   Navigation,
   Pencil,
   Pill,
-  School,
+  RotateCcw,
   Scissors,
   Search,
   Shirt,
-  ShoppingBasket,
   Sparkles,
-  Star,
   Stethoscope,
   Store,
   UtensilsCrossed,
   Wrench,
-  RotateCcw,
+  Building2,
+  ExternalLink,
   type LucideIcon,
 } from "lucide-react";
-import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,105 +41,68 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Chip,
-  EmptyState,
-  GlassCard,
-  PageLoader,
-  SectionHeader,
-  ViewTitle,
-} from "@/components/homesync/glass";
-import { placePins } from "@/components/homesync/family-map-data";
-import { RadarSweep } from "@/components/homesync/icons";
+import { EmptyState, GlassCard, SectionHeader, ViewTitle } from "@/components/homesync/glass";
 import { useResource } from "@/lib/homesync/api";
-import type { NearbyStore, StoreCategory } from "@/lib/homesync/types";
 import { cn } from "@/lib/utils";
 
-interface StoresResponse {
-  categories: StoreCategory[];
-  stores: NearbyStore[];
+/** One real search result from GET /api/nearby. */
+interface NearbyResult {
+  id: string;
+  name: string;
+  category: string;
+  address: string | null; // web search carries no structured address — null today
+  snippet: string | null;
+  link: string | null;
 }
 
-/** Real satellite map (Leaflet) — loaded client-side only. */
-const FamilyMap = dynamic(
-  () => import("@/components/homesync/family-map").then((m) => m.FamilyMap),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex h-full w-full items-center justify-center">
-        <span className="h-6 w-6 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
-      </div>
-    ),
-  }
-);
-
-/** Vantage points (cosmetic — results are returned around the selected place). */
-const PLACES: { key: string; icon: LucideIcon; label: string }[] = [
-  { key: "home", icon: House, label: "Home" },
-  { key: "school", icon: School, label: "School" },
-  { key: "office", icon: Building2, label: "Office" },
-  { key: "clinic", icon: Stethoscope, label: "Clinic" },
-  { key: "market", icon: ShoppingBasket, label: "Fresh Mart" },
-];
-
 const RADII: { value: string; label: string }[] = [
-  { value: "0.5", label: "500 m" },
   { value: "1", label: "1 km" },
   { value: "3", label: "3 km" },
   { value: "5", label: "5 km" },
   { value: "10", label: "10 km" },
 ];
 
-/** Singular category label for a store card (server returns plural labels for chips). */
-const CATEGORY_LABELS: Record<string, string> = {
-  grocery: "Grocery Shop",
-  supermarket: "Supermarket",
-  restaurant: "Restaurant",
-  cafe: "Café",
-  pharmacy: "Pharmacy",
-  barber: "Barber",
-  salon: "Salon",
-  stationery: "Stationery",
-  clinic: "Clinic",
-  hardware: "Hardware",
-  laundry: "Laundry",
-};
+const CATEGORIES: { key: string; label: string; icon: LucideIcon }[] = [
+  { key: "grocery", label: "Grocery", icon: Store },
+  { key: "supermarket", label: "Supermarket", icon: Building2 },
+  { key: "restaurant", label: "Restaurant", icon: UtensilsCrossed },
+  { key: "cafe", label: "Café", icon: Coffee },
+  { key: "pharmacy", label: "Pharmacy", icon: Pill },
+  { key: "barber", label: "Barber", icon: Scissors },
+  { key: "salon", label: "Salon", icon: Sparkles },
+  { key: "stationery", label: "Stationery", icon: Pencil },
+  { key: "clinic", label: "Clinic", icon: Stethoscope },
+  { key: "hardware", label: "Hardware", icon: Wrench },
+  { key: "laundry", label: "Laundry", icon: Shirt },
+];
 
-/** Category key → Lucide icon (the API returns {key, label, count} only — no emoji). */
-const CATEGORY_ICONS: Record<string, LucideIcon> = {
-  grocery: Store,
-  supermarket: Building2,
-  restaurant: UtensilsCrossed,
-  cafe: Coffee,
-  pharmacy: Pill,
-  barber: Scissors,
-  salon: Sparkles,
-  stationery: Pencil,
-  clinic: Stethoscope,
-  hardware: Wrench,
-  laundry: Shirt,
-};
+const chipBase =
+  "flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-xs font-medium transition";
 
-function categoryIcon(key: string): LucideIcon {
-  return CATEGORY_ICONS[key] ?? Store;
+function ResultSkeleton({ count = 4 }: { count?: number }) {
+  return (
+    <div className="space-y-2.5" aria-hidden>
+      {Array.from({ length: count }).map((_, i) => (
+        <GlassCard key={i} className="p-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="h-4 w-2/5 animate-pulse rounded-md bg-muted" />
+            <div className="h-4 w-16 animate-pulse rounded-md bg-muted" />
+          </div>
+          <div className="mt-2 h-3 w-4/5 animate-pulse rounded-md bg-muted" />
+          <div className="mt-1.5 h-3 w-3/5 animate-pulse rounded-md bg-muted" />
+        </GlassCard>
+      ))}
+    </div>
+  );
 }
 
-function fmtDistance(km: number): string {
-  return km < 1 ? `${Math.round(km * 1000)} m` : `${km} km`;
-}
-
-function OpenStatusChip({ openNow }: { openNow: boolean | null }) {
-  if (openNow === true) return <Chip tone="success">Open now</Chip>;
-  if (openNow === false) return <Chip tone="danger">Closed</Chip>;
-  return <Chip>Hours unknown</Chip>;
-}
-
-function StoreCard({ store }: { store: NearbyStore }) {
+function ResultCard({ result }: { result: NearbyResult }) {
+  const destination = encodeURIComponent(
+    [result.name, result.address].filter(Boolean).join(", ")
+  );
   const openDirections = () =>
     window.open(
-      `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-        `${store.name} ${store.address}`
-      )}`,
+      `https://www.google.com/maps/dir/?api=1&destination=${destination}`,
       "_blank",
       "noopener,noreferrer"
     );
@@ -147,47 +111,33 @@ function StoreCard({ store }: { store: NearbyStore }) {
     <GlassCard hover className="p-3.5">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold">{store.name}</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            {CATEGORY_LABELS[store.category] ?? store.category}
+          {result.link ? (
+            <a
+              href={result.link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 truncate text-sm font-semibold hover:text-primary hover:underline"
+              title={`Open ${result.name}`}
+            >
+              <span className="truncate">{result.name}</span>
+              <ExternalLink className="h-3 w-3 shrink-0 opacity-50" aria-hidden />
+            </a>
+          ) : (
+            <p className="truncate text-sm font-semibold">{result.name}</p>
+          )}
+          <p className="mt-0.5 text-xs capitalize text-muted-foreground">
+            {CATEGORIES.find((c) => c.key === result.category)?.label ?? result.category}
           </p>
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-1">
-          <Chip tone="brand">
-            <MapPin className="h-3 w-3" /> {fmtDistance(store.distanceKm)}
-          </Chip>
-          <Chip>
-            <Footprints className="h-3 w-3" /> ~{store.etaMins} min
-          </Chip>
-        </div>
       </div>
-      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <span className="flex items-center gap-1 text-xs font-semibold text-foreground/80">
-          <Star className="h-3.5 w-3.5 fill-current" /> {store.rating.toFixed(1)}
-        </span>
-        <span className="text-[11px] text-muted-foreground">({store.reviews} reviews)</span>
-        <OpenStatusChip openNow={store.openNow} />
-      </div>
-      <p
-        className="mt-1.5 flex items-center gap-1 truncate text-xs text-muted-foreground"
-        title={store.address}
-      >
-        <MapPin className="h-3.5 w-3.5 shrink-0" /> {store.address}
-      </p>
-      <div className="mt-3 flex gap-2">
-        <Button size="sm" variant="outline" className="flex-1" onClick={openDirections}>
+      {result.snippet ? (
+        <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+          {result.snippet}
+        </p>
+      ) : null}
+      <div className="mt-3">
+        <Button size="sm" variant="outline" className="w-full sm:w-auto" onClick={openDirections}>
           <Navigation className="h-4 w-4" /> Directions
-        </Button>
-        <Button
-          size="sm"
-          className="flex-1 brand-gradient border-0 text-white shadow-md"
-          onClick={() =>
-            toast.success("Request sent to family — someone can accept it from their app", {
-              description: `${store.name} • ${fmtDistance(store.distanceKm)} away`,
-            })
-          }
-        >
-          <Hand className="h-4 w-4" /> Request help
         </Button>
       </div>
     </GlassCard>
@@ -195,7 +145,6 @@ function StoreCard({ store }: { store: NearbyStore }) {
 }
 
 export function NearbyView() {
-  const [place, setPlace] = useState("home");
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
   const [radiusKm, setRadiusKm] = useState("5");
@@ -211,67 +160,34 @@ export function NearbyView() {
     const params = new URLSearchParams({ radiusKm });
     if (category) params.set("category", category);
     if (debouncedQ) params.set("q", debouncedQ);
-    return `/api/stores?${params.toString()}`;
+    return `/api/nearby?${params.toString()}`;
   }, [radiusKm, category, debouncedQ]);
 
-  const { data, loading, error, refresh } = useResource<StoresResponse>(url);
-
-  const categories = data?.categories ?? [];
-  const stores = data?.stores ?? [];
-  const totalCount = categories.reduce((sum, c) => sum + c.count, 0);
-  const isFiltered = Boolean(category || debouncedQ || radiusKm !== "5");
-  const radiusLabel = RADII.find((r) => r.value === radiusKm)?.label ?? `${radiusKm} km`;
+  const { data, loading, error, refresh } = useResource<{ results: NearbyResult[] }>(url);
+  const results = useMemo(() => (Array.isArray(data?.results) ? data.results : []), [data]);
+  const isFiltered = Boolean(category || debouncedQ);
 
   const resetFilters = () => {
     setCategory(null);
     setQ("");
     setDebouncedQ("");
-    setRadiusKm("5");
   };
-
-  const chipBase =
-    "flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-xs font-medium transition";
 
   return (
     <div className="space-y-4">
       <ViewTitle
         title="Nearby Services"
-        sub="Shops, clinics and help around the places your family visits"
+        sub="Live web search for shops, clinics and services around your home"
       />
 
-      {/* Vantage points */}
+      {/* Search controls */}
       <GlassCard className="p-4 sm:p-5">
         <SectionHeader
-          icon={<MapPin className="h-4 w-4" />}
-          title="Search around"
-          sub="Results around the selected place"
+          icon={<Compass className="h-4 w-4" />}
+          title="Search places"
+          sub="Real results from live web search around your home"
         />
-        <div className="mt-3 flex flex-wrap gap-2">
-          {PLACES.map((p) => {
-            const PlaceIcon = p.icon;
-            return (
-              <button
-                key={p.key}
-                type="button"
-                onClick={() => setPlace(p.key)}
-                aria-pressed={place === p.key}
-                className={cn(
-                  "inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-medium transition",
-                  place === p.key
-                    ? "brand-gradient border-0 text-white shadow-md"
-                    : "glass-inset border-white/40 text-muted-foreground hover:text-foreground dark:border-white/10"
-                )}
-              >
-                <PlaceIcon className="h-3.5 w-3.5" /> {p.label}
-              </button>
-            );
-          })}
-        </div>
-      </GlassCard>
-
-      {/* Controls */}
-      <GlassCard className="p-4 sm:p-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+        <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-end">
           <div className="flex-1 space-y-1.5">
             <Label htmlFor="nearby-search" className="text-xs text-muted-foreground">
               Search
@@ -282,15 +198,15 @@ export function NearbyView() {
                 id="nearby-search"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search by name or address…"
+                placeholder="Search shops and services by name…"
                 className="pl-9"
               />
             </div>
           </div>
           <div className="space-y-1.5">
-            <Label className="text-xs text-muted-foreground">Radius</Label>
+            <Label className="text-xs text-muted-foreground">Search area</Label>
             <Select value={radiusKm} onValueChange={setRadiusKm}>
-              <SelectTrigger className="w-full sm:w-[120px]" aria-label="Search radius">
+              <SelectTrigger className="w-full sm:w-[130px]" aria-label="Search area">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -303,8 +219,60 @@ export function NearbyView() {
             </Select>
           </div>
         </div>
+        <p className="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground">
+          <Compass className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+          Distances, ratings and opening hours aren&apos;t shown — web search results don&apos;t carry
+          reliable data for them.
+        </p>
       </GlassCard>
 
+      {/* Category chips */}
+      <GlassCard className="p-4 sm:p-5">
+        <SectionHeader
+          icon={<Store className="h-4 w-4" />}
+          title="Categories"
+          sub={category ? "Tap the active category again to clear it" : "Filter by category"}
+        />
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setCategory(null)}
+            aria-pressed={category === null}
+            className={cn(
+              chipBase,
+              category === null
+                ? "brand-gradient border-0 text-white shadow-md"
+                : "glass-inset border-white/40 hover:border-primary/40 dark:border-white/10"
+            )}
+          >
+            <Compass className="h-4 w-4 shrink-0" aria-hidden />
+            <span className="truncate">All nearby</span>
+          </button>
+          {CATEGORIES.map((c) => {
+            const active = category === c.key;
+            const CategoryIcon = c.icon;
+            return (
+              <button
+                key={c.key}
+                type="button"
+                onClick={() => setCategory(active ? null : c.key)}
+                aria-pressed={active}
+                className={cn(
+                  chipBase,
+                  active
+                    ? "brand-gradient border-0 text-white shadow-md"
+                    : "glass-inset border-white/40 hover:border-primary/40 dark:border-white/10"
+                )}
+              >
+                <CategoryIcon className="h-4 w-4 shrink-0" aria-hidden />
+                <span className="truncate">{c.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </GlassCard>
+
+      {/* Results */}
       {error ? (
         <GlassCard className="p-4 sm:p-5">
           <EmptyState
@@ -319,107 +287,66 @@ export function NearbyView() {
           </div>
         </GlassCard>
       ) : loading && !data ? (
-        <PageLoader label="Finding places nearby…" />
+        <GlassCard className="p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-sm font-semibold">Searching nearby…</p>
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+          </div>
+          <div className="mt-3">
+            <ResultSkeleton />
+          </div>
+        </GlassCard>
+      ) : results.length === 0 ? (
+        <GlassCard className="p-4 sm:p-5">
+          <EmptyState
+            icon={<Search className="h-10 w-10" />}
+            title="No results here yet — try another category"
+            sub={
+              isFiltered
+                ? "Nothing matched this filter. Try a different category or search term."
+                : "Search for a shop or service by name above."
+            }
+          />
+          {isFiltered ? (
+            <div className="mt-3 flex justify-center">
+              <Button variant="outline" onClick={resetFilters}>
+                <RotateCcw /> Reset filters
+              </Button>
+            </div>
+          ) : null}
+        </GlassCard>
       ) : (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
-          {/* LEFT — map + categories */}
-          <div className="space-y-4">
-            <FamilyMap pins={placePins()} className="h-[300px] lg:h-[520px]" mapStyle="satellite" />
-
-            <GlassCard className="p-4 sm:p-5">
-              <SectionHeader
-                icon={<RadarSweep size={16} />}
-                title="Categories"
-                sub={category ? "Tap the active category again to clear it" : "Filter by category"}
-              />
-              <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-                <button
-                  type="button"
-                  onClick={() => setCategory(null)}
-                  aria-pressed={category === null}
-                  className={cn(
-                    chipBase,
-                    category === null
-                      ? "brand-gradient border-0 text-white shadow-md"
-                      : "glass-inset border-white/40 hover:border-primary/40 dark:border-white/10"
-                  )}
-                >
-                  <Globe className="h-4 w-4 shrink-0" aria-hidden />
-                  <span className="min-w-0 flex-1 truncate">All</span>
-                  <span
-                    className={cn(
-                      "rounded-full px-1.5 py-0.5 text-[10px] font-semibold",
-                      category === null ? "bg-white/25" : "bg-muted"
-                    )}
-                  >
-                    {totalCount}
-                  </span>
-                </button>
-                {categories.map((c) => {
-                  const active = category === c.key;
-                  const CategoryIcon = categoryIcon(c.key);
-                  return (
-                    <button
-                      key={c.key}
-                      type="button"
-                      onClick={() => setCategory(active ? null : c.key)}
-                      aria-pressed={active}
-                      className={cn(
-                        chipBase,
-                        active
-                          ? "brand-gradient border-0 text-white shadow-md"
-                          : "glass-inset border-white/40 hover:border-primary/40 dark:border-white/10"
-                      )}
-                    >
-                      <CategoryIcon className="h-4 w-4 shrink-0" aria-hidden />
-                      <span className="min-w-0 flex-1 truncate">{c.label}</span>
-                      <span
-                        className={cn(
-                          "rounded-full px-1.5 py-0.5 text-[10px] font-semibold",
-                          active ? "bg-white/25" : "bg-muted"
-                        )}
-                      >
-                        {c.count}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </GlassCard>
+        <GlassCard className="p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-semibold">
+              {results.length} result{results.length === 1 ? "" : "s"}
+              {category ? (
+                <span className="font-normal text-muted-foreground">
+                  {" "}
+                  • {CATEGORIES.find((c) => c.key === category)?.label ?? category}
+                </span>
+              ) : null}
+              {debouncedQ ? (
+                <span className="font-normal text-muted-foreground"> • “{debouncedQ}”</span>
+              ) : null}
+            </p>
+            {isFiltered ? (
+              <Button size="sm" variant="outline" onClick={resetFilters}>
+                <RotateCcw /> Reset filters
+              </Button>
+            ) : null}
           </div>
-
-          {/* RIGHT — results */}
-          <div className="space-y-3 self-start lg:sticky lg:top-20">
-            <GlassCard className="p-4 sm:p-5">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-sm font-semibold">
-                  {stores.length} place{stores.length === 1 ? "" : "s"} • within {radiusLabel}
-                </p>
-                {isFiltered ? (
-                  <Button size="sm" variant="outline" onClick={resetFilters}>
-                    <RotateCcw /> Reset filters
-                  </Button>
-                ) : null}
-              </div>
-
-              {stores.length === 0 ? (
-                <div className="mt-4">
-                  <EmptyState
-                    icon={<Search className="h-10 w-10" />}
-                    title="No places found"
-                    sub="Try a wider radius or another category"
-                  />
-                </div>
-              ) : (
-                <div className="mt-3 max-h-96 space-y-2.5 overflow-y-auto pr-1 scrollbar-slim lg:max-h-[560px]">
-                  {stores.map((s) => (
-                    <StoreCard key={s.id} store={s} />
-                  ))}
-                </div>
-              )}
-            </GlassCard>
+          <div
+            className={cn(
+              "scrollbar-slim mt-3 max-h-96 space-y-2.5 overflow-y-auto pr-1 transition-opacity lg:max-h-[560px]",
+              loading && "pointer-events-none opacity-50"
+            )}
+          >
+            {results.map((r) => (
+              <ResultCard key={r.id} result={r} />
+            ))}
           </div>
-        </div>
+        </GlassCard>
       )}
     </div>
   );

@@ -5,10 +5,12 @@ import { useTheme } from "next-themes";
 import {
   Bell,
   CalendarPlus,
+  CheckCheck,
   Command,
   Compass,
   Home as HomeIcon,
   ListChecks,
+  Loader2,
   Lock,
   LogOut,
   MapPinned,
@@ -25,9 +27,9 @@ import {
 import { toast } from "sonner";
 import { NAV_ITEMS, useAppStore } from "@/lib/homesync/store";
 import { useSession } from "@/lib/homesync/session";
-import { allowedViews, canWrite, roleBadge } from "@/lib/homesync/roles";
-import { useResource, fmtDate, timeAgo } from "@/lib/homesync/api";
-import type { ActivityEntry, Member, ViewKey } from "@/lib/homesync/types";
+import { ALL_VIEWS, allowedViews, canWrite, roleBadge } from "@/lib/homesync/roles";
+import { apiSend, useResource, fmtDate, timeAgo } from "@/lib/homesync/api";
+import type { AppNotification, Member, ViewKey } from "@/lib/homesync/types";
 import { cn } from "@/lib/utils";
 import { GlassCard, MemberAvatar } from "./glass";
 import { HomeSyncMark, ShieldUserIcon } from "./icons";
@@ -102,43 +104,148 @@ function ThemeToggle() {
 
 /* ---------------- Notifications ---------------- */
 
+/**
+ * Real in-app notifications — loaded from GET /api/notifications only while
+ * the sheet is open. Click marks read (PATCH); a valid view link navigates.
+ */
 function NotificationsBell() {
   const [open, setOpen] = useState(false);
-  const { data } = useResource<ActivityEntry[]>(open ? "/api/activity" : null);
+  const [markingAll, setMarkingAll] = useState(false);
+  const setView = useAppStore((s) => s.setView);
+  const { data, loading, error, refresh, setData } = useResource<{ notifications: AppNotification[] }>(
+    open ? "/api/notifications" : null
+  );
+  const notifications = data?.notifications ?? [];
+  const unread = notifications.filter((n) => !n.read).length;
+
+  /** Optimistic mark-read with honest rollback if the server refuses. */
+  function markOne(id: string) {
+    setData((prev) =>
+      prev
+        ? { notifications: prev.notifications.map((n) => (n.id === id ? { ...n, read: true } : n)) }
+        : prev
+    );
+    apiSend("/api/notifications", "PATCH", { id }).catch(() => {
+      toast.error("Could not mark the notification as read");
+      void refresh();
+    });
+  }
+
+  async function markAllRead() {
+    if (markingAll) return;
+    try {
+      setMarkingAll(true);
+      await apiSend("/api/notifications", "PATCH", { all: true });
+      setData((prev) =>
+        prev ? { notifications: prev.notifications.map((n) => ({ ...n, read: true })) } : prev
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not mark notifications as read");
+    } finally {
+      setMarkingAll(false);
+    }
+  }
+
+  function openItem(n: AppNotification) {
+    if (!n.read) markOne(n.id);
+    if (n.link && (ALL_VIEWS as string[]).includes(n.link)) {
+      setOpen(false);
+      setView(n.link as ViewKey);
+    }
+  }
+
   return (
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <Button
           variant="ghost"
           size="icon"
-          aria-label="Notifications"
+          aria-label={unread > 0 ? `Notifications, ${unread} unread` : "Notifications"}
           className="relative rounded-full glass hover:bg-transparent"
         >
           <Bell className="h-4.5 w-4.5" />
-          <span className="brand-gradient absolute right-1.5 top-1.5 h-2 w-2 rounded-full" />
+          {unread > 0 ? (
+            <span className="brand-gradient absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] font-bold text-white">
+              {unread > 9 ? "9+" : unread}
+            </span>
+          ) : null}
         </Button>
       </SheetTrigger>
       <SheetContent side="right" className="w-[320px] sm:w-[380px] glass-strong border-white/40 dark:border-white/10">
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
-            <Bell className="h-4 w-4 text-primary" /> Family activity
+            <Bell className="h-4 w-4 text-primary" /> Notifications
           </SheetTitle>
         </SheetHeader>
         <div className="px-4 pb-6">
-          <ScrollArea className="h-[calc(100vh-8rem)] pr-3">
-            {!data ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">Loading…</p>
-            ) : data.length === 0 ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">No recent activity.</p>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">
+              {loading && notifications.length === 0
+                ? "Loading…"
+                : unread > 0
+                  ? `${unread} unread`
+                  : "You’re all caught up."}
+            </p>
+            {unread > 0 ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 rounded-full px-2.5 text-[11px]"
+                disabled={markingAll}
+                onClick={() => void markAllRead()}
+              >
+                {markingAll ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <CheckCheck className="h-3.5 w-3.5" />
+                )}
+                Mark all read
+              </Button>
+            ) : null}
+          </div>
+          <ScrollArea className="h-[calc(100vh-11rem)] pr-3">
+            {loading && notifications.length === 0 ? (
+              <div className="flex justify-center py-8">
+                <span className="h-6 w-6 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+              </div>
+            ) : error ? (
+              <div className="py-8 text-center">
+                <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+                <Button variant="outline" size="sm" className="mt-3" onClick={() => void refresh()}>
+                  Try again
+                </Button>
+              </div>
+            ) : notifications.length === 0 ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">You&apos;re all caught up.</p>
             ) : (
               <ul className="space-y-1">
-                {data.map((a) => (
-                  <li key={a.id} className="rounded-xl px-3 py-2.5 transition-colors hover:bg-accent/60">
-                    <p className="text-[13px] leading-snug">
-                      <span className="font-semibold">{a.actor}</span> {a.action}{" "}
-                      <span className="font-medium text-primary">{a.target}</span>
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">{timeAgo(a.createdAt)}</p>
+                {notifications.map((n) => (
+                  <li key={n.id}>
+                    <button
+                      type="button"
+                      onClick={() => openItem(n)}
+                      aria-label={`${n.title}${n.read ? "" : " — unread"}`}
+                      className={cn(
+                        "w-full rounded-xl px-3 py-2.5 text-left transition-colors hover:bg-accent/60",
+                        !n.read && "bg-primary/5"
+                      )}
+                    >
+                      <span className="flex items-center gap-2">
+                        {!n.read ? <span className="brand-gradient h-1.5 w-1.5 shrink-0 rounded-full" /> : null}
+                        <span
+                          className={cn(
+                            "truncate text-[13px] leading-snug",
+                            n.read ? "font-medium text-muted-foreground" : "font-semibold"
+                          )}
+                        >
+                          {n.title}
+                        </span>
+                      </span>
+                      {n.body ? (
+                        <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{n.body}</span>
+                      ) : null}
+                      <span className="mt-1 block text-[10px] text-muted-foreground">{timeAgo(n.createdAt)}</span>
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -178,7 +285,7 @@ function UserMenu() {
           <div className="min-w-0 leading-tight">
             <p className="truncate text-sm font-semibold">{user.name}</p>
             <p className="truncate text-[11px] font-normal text-muted-foreground">
-              {user.isGuest ? "Exploring as guest" : user.email}
+              {user.email}
             </p>
           </div>
         </DropdownMenuLabel>
@@ -188,20 +295,16 @@ function UserMenu() {
             <ShieldUserIcon size={12} /> {user.role} — {roleBadge(user.role)}
           </span>
         </DropdownMenuLabel>
-        {!user.isGuest && (
-          <DropdownMenuItem onClick={() => setView("settings")}>
-            <UserRound className="h-4 w-4" /> Profile &amp; settings
-          </DropdownMenuItem>
-        )}
-        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => setView("settings")}>
+          <UserRound className="h-4 w-4" /> Profile &amp; settings
+        </DropdownMenuItem>
         <DropdownMenuItem
           variant="destructive"
           onClick={() => {
-            logout();
-            toast("Signed out — see you soon");
+            void logout().then(() => toast("Signed out — see you soon"));
           }}
         >
-          <LogOut className="h-4 w-4" /> {user.isGuest ? "Exit guest mode" : "Sign out"}
+          <LogOut className="h-4 w-4" /> Sign out
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

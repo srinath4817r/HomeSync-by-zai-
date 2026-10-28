@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  BellOff,
-  BellRing,
+  CalendarClock,
   Check,
   CheckCheck,
   Eye,
@@ -12,17 +11,29 @@ import {
   Pill,
   Plus,
   RotateCcw,
-  Siren,
   SkipForward,
+  Trash2,
   TriangleAlert,
+  UserRound,
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { apiSend, fmtDate, useResource } from "@/lib/homesync/api";
+import { apiSend, fmtDate, fmtTime, useResource } from "@/lib/homesync/api";
 import { canWrite } from "@/lib/homesync/roles";
 import { useSession } from "@/lib/homesync/session";
 import { useAppStore } from "@/lib/homesync/store";
-import type { Medicine, Member } from "@/lib/homesync/types";
+import type { Member } from "@/lib/homesync/types";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -50,7 +61,27 @@ import {
   ViewTitle,
 } from "@/components/homesync/glass";
 
-type MedicineAction = "take" | "skip" | "miss" | "escalate" | "acknowledge" | "reset";
+/**
+ * A medicine dose exactly as GET /api/medicines returns it.
+ * Status is one of scheduled | taken | skipped | acknowledged — confirmations
+ * carry actedBy/actedAt, recorded server-side from the signed-in session.
+ */
+interface Dose {
+  id: string;
+  memberId: string;
+  caregiverId: string | null;
+  name: string;
+  dosage: string;
+  timeLabel: string;
+  instructions: string | null;
+  status: "scheduled" | "taken" | "skipped" | "acknowledged";
+  scheduledAt: string;
+  actedAt: string | null;
+  actedBy: string | null;
+  createdAt: string;
+}
+
+type DoseStatus = Dose["status"];
 type ToastKind = "success" | "info" | "warning";
 
 interface AddForm {
@@ -68,25 +99,21 @@ function emptyForm(): AddForm {
   return { name: "", dosage: "1 tablet", time: "", memberId: "", caregiverId: "none", instructions: "" };
 }
 
-function startOfToday(): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-/** Chip for a dose status — "acknowledged" deliberately never reads as "taken". */
-function StatusChip({ status }: { status: string }) {
+/** Chip for a dose status — every state is a real, recorded state. */
+function StatusChip({ status }: { status: DoseStatus }) {
   if (status === "taken")
     return (
       <Chip tone="success">
-        <Check className="h-3 w-3" /> Confirmed taken
+        <Check className="h-3 w-3" /> Taken
       </Chip>
     );
-  if (status === "skipped") return <Chip>Skipped</Chip>;
-  if (status === "confirmation_pending") return <Chip tone="warning">Confirmation pending</Chip>;
-  if (status === "escalated") return <Chip tone="danger">Escalated to caregiver</Chip>;
-  if (status === "acknowledged") return <Chip tone="brand">Caregiver acknowledged</Chip>;
-  return <Chip>Scheduled</Chip>;
+  if (status === "skipped") return <Chip tone="warning">Skipped</Chip>;
+  if (status === "acknowledged") return <Chip tone="brand">Acknowledged</Chip>;
+  return (
+    <Chip>
+      <CalendarClock className="h-3 w-3" /> Scheduled
+    </Chip>
+  );
 }
 
 /** Shown where mutation controls would be, for read-only roles. */
@@ -98,128 +125,94 @@ function ViewOnlyChip() {
   );
 }
 
-/** Caregiver to display for this dose (escalation target wins over assigned caregiver). */
-function caregiverFor(med: Medicine, byId: Map<string, Member>): Member | null {
-  const id = med.escalatedToId ?? med.caregiverId;
-  return id ? (byId.get(id) ?? null) : null;
+/** Assigned caregiver for this dose, if any (plain assignment — no automation theater). */
+function caregiverFor(dose: Dose, byId: Map<string, Member>): Member | null {
+  return dose.caregiverId ? (byId.get(dose.caregiverId) ?? null) : null;
 }
 
-/** Large touch-target action buttons, driven by the dose status state machine. */
+/** Dose action buttons — every button sends a real PATCH { id, status }. */
 function DoseActions({
-  med,
+  dose,
   busy,
   onAct,
 }: {
-  med: Medicine;
+  dose: Dose;
   busy: boolean;
-  onAct: (action: MedicineAction, message: string, kind?: ToastKind) => void;
+  onAct: (status: DoseStatus, message: string, kind?: ToastKind) => void;
 }) {
-  const takeMsg = `${med.name} at ${med.timeLabel} confirmed taken`;
-  if (med.status === "scheduled") {
+  if (dose.status !== "scheduled") {
     return (
-      <>
-        <Button
-          className={`h-11 px-5 text-sm ${PRIMARY_BTN}`}
-          disabled={busy}
-          onClick={() => onAct("take", takeMsg)}
-        >
-          <Check className="h-4 w-4" /> Take
-        </Button>
-        <Button
-          variant="ghost"
-          className="h-11 px-4 text-sm"
-          disabled={busy}
-          onClick={() => onAct("miss", `No response detected — ${med.name} (${med.timeLabel}) is now confirmation pending`, "warning")}
-        >
-          <BellOff className="h-4 w-4" /> Missed
-        </Button>
-        <Button
-          variant="ghost"
-          className="h-11 px-4 text-sm"
-          disabled={busy}
-          onClick={() => onAct("skip", `${med.name} at ${med.timeLabel} skipped`, "info")}
-        >
-          <SkipForward className="h-4 w-4" /> Skip
-        </Button>
-      </>
-    );
-  }
-  if (med.status === "confirmation_pending") {
-    return (
-      <>
-        <Button className={`h-11 px-5 text-sm ${PRIMARY_BTN}`} disabled={busy} onClick={() => onAct("take", takeMsg)}>
-          <CheckCheck className="h-4 w-4" /> Confirm taken
-        </Button>
-        <Button
-          variant="outline"
-          className="h-11 border-red-500/40 px-4 text-sm text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-          disabled={busy}
-          onClick={() => onAct("escalate", `Caregiver alerted about ${med.name} (${med.timeLabel})`, "warning")}
-        >
-          <BellRing className="h-4 w-4" /> Escalate to caregiver
-        </Button>
-        <Button
-          variant="ghost"
-          className="h-11 px-4 text-sm"
-          disabled={busy}
-          onClick={() => onAct("reset", `${med.name} reset to scheduled`, "info")}
-        >
-          <RotateCcw className="h-4 w-4" /> Reset
-        </Button>
-      </>
-    );
-  }
-  if (med.status === "escalated") {
-    return (
-      <>
-        <Button
-          variant="secondary"
-          className="h-11 px-4 text-sm"
-          disabled={busy}
-          onClick={() => onAct("acknowledge", `Caregiver acknowledged ${med.name} — dose still needs confirmation`, "info")}
-        >
-          Acknowledge
-        </Button>
-        <Button className={`h-11 px-5 text-sm ${PRIMARY_BTN}`} disabled={busy} onClick={() => onAct("take", takeMsg)}>
-          <CheckCheck className="h-4 w-4" /> Confirm taken
-        </Button>
-      </>
-    );
-  }
-  if (med.status === "acknowledged") {
-    return (
-      <Button className={`h-11 px-5 text-sm ${PRIMARY_BTN}`} disabled={busy} onClick={() => onAct("take", takeMsg)}>
-        <CheckCheck className="h-4 w-4" /> Confirm taken
+      <Button
+        variant="ghost"
+        className="h-11 px-4 text-sm"
+        disabled={busy}
+        onClick={() => onAct("scheduled", `${dose.name} at ${dose.timeLabel} set back to scheduled`, "info")}
+      >
+        <RotateCcw className="h-4 w-4" /> Undo
       </Button>
     );
   }
-  // taken | skipped
   return (
-    <Button
-      variant="ghost"
-      className="h-11 px-4 text-sm"
-      disabled={busy}
-      onClick={() => onAct("reset", `${med.name} reset to scheduled`, "info")}
-    >
-      <RotateCcw className="h-4 w-4" /> Reset
-    </Button>
+    <>
+      <Button
+        className={`h-11 px-5 text-sm ${PRIMARY_BTN}`}
+        disabled={busy}
+        onClick={() => onAct("taken", `${dose.name} at ${dose.timeLabel} marked taken`)}
+      >
+        {busy ? (
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+        ) : (
+          <Check className="h-4 w-4" />
+        )}
+        Mark taken
+      </Button>
+      <Button
+        variant="ghost"
+        className="h-11 px-4 text-sm"
+        disabled={busy}
+        onClick={() => onAct("skipped", `${dose.name} at ${dose.timeLabel} marked skipped`, "info")}
+      >
+        <SkipForward className="h-4 w-4" /> Skipped
+      </Button>
+      <Button
+        variant="outline"
+        className="h-11 px-4 text-sm"
+        disabled={busy}
+        onClick={() => onAct("acknowledged", `${dose.name} at ${dose.timeLabel} acknowledged`, "info")}
+      >
+        <CheckCheck className="h-4 w-4" /> Acknowledge
+      </Button>
+    </>
   );
 }
 
-function MedicineCard({
-  med,
+/** Who confirmed this dose and when — straight from the server record. */
+function ActedByLine({ dose }: { dose: Dose }) {
+  if (!dose.actedBy || !dose.actedAt || dose.status === "scheduled") return null;
+  return (
+    <p className="mt-0.5 flex items-center gap-1 text-xs font-medium text-foreground/70">
+      <CheckCheck className="h-3 w-3 shrink-0" />
+      Confirmed by {dose.actedBy} • {fmtTime(dose.actedAt)}
+    </p>
+  );
+}
+
+function DoseCard({
+  dose,
   member,
   caregiver,
   busy,
   writable,
   onAct,
+  onDelete,
 }: {
-  med: Medicine;
+  dose: Dose;
   member: Member | null;
   caregiver: Member | null;
   busy: boolean;
   writable: boolean;
-  onAct: (action: MedicineAction, message: string, kind?: ToastKind) => void;
+  onAct: (status: DoseStatus, message: string, kind?: ToastKind) => void;
+  onDelete: () => void;
 }) {
   return (
     <GlassCard className="p-4">
@@ -234,40 +227,64 @@ function MedicineCard({
             className="shrink-0"
           />
           <div className="min-w-0">
-            <p className="text-lg font-bold leading-none tabular-nums">{med.timeLabel}</p>
+            <p className="text-lg font-bold leading-none tabular-nums">{dose.timeLabel}</p>
             <p className="mt-1 truncate text-sm font-semibold">
-              {med.name} <span className="font-normal text-muted-foreground">· {med.dosage}</span>
+              {dose.name} <span className="font-normal text-muted-foreground">· {dose.dosage}</span>
             </p>
-            {med.instructions ? (
+            {dose.instructions ? (
               <p className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
-                <Lightbulb className="h-3 w-3 shrink-0" /> {med.instructions}
+                <Lightbulb className="h-3 w-3 shrink-0" /> {dose.instructions}
               </p>
             ) : null}
-            {med.status === "escalated" && caregiver ? (
-              <p className="mt-0.5 flex items-center gap-1 text-xs font-medium text-red-600 dark:text-red-400">
-                <BellRing className="h-3 w-3 shrink-0" /> Alert sent to {caregiver.name}
+            {caregiver ? (
+              <p className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                <HeartHandshake className="h-3 w-3 shrink-0" /> Caregiver: {caregiver.name}
               </p>
             ) : null}
-            {med.status === "escalated" && !caregiver ? (
-              <p className="mt-0.5 flex items-center gap-1 text-xs font-medium text-red-600 dark:text-red-400">
-                <BellRing className="h-3 w-3 shrink-0" /> Escalated — no caregiver assigned for this dose
-              </p>
-            ) : null}
-            {med.status === "acknowledged" && caregiver ? (
-              <p className="mt-0.5 flex items-center gap-1 text-xs font-medium text-primary">
-                <HeartHandshake className="h-3 w-3 shrink-0" /> {caregiver.name} is aware — dose still needs
-                confirmation
-              </p>
-            ) : null}
+            <ActedByLine dose={dose} />
           </div>
         </div>
-        <div className="shrink-0 pt-0.5">
-          <StatusChip status={med.status} />
+        <div className="flex shrink-0 items-start gap-1 pt-0.5">
+          {writable ? (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-9 w-9 text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
+                  disabled={busy}
+                  aria-label={`Delete ${dose.name} at ${dose.timeLabel}`}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Delete this dose?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {dose.name} at {dose.timeLabel}
+                    {member ? ` for ${member.name}` : ""} will be removed for the whole household. This
+                    cannot be undone.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-red-600 text-white hover:bg-red-700 focus-visible:ring-red-500/40"
+                    onClick={onDelete}
+                  >
+                    Delete dose
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          ) : null}
+          <StatusChip status={dose.status} />
         </div>
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         {writable ? (
-          <DoseActions med={med} busy={busy} onAct={onAct} />
+          <DoseActions dose={dose} busy={busy} onAct={onAct} />
         ) : (
           <ViewOnlyChip />
         )}
@@ -277,7 +294,7 @@ function MedicineCard({
 }
 
 export function CareView() {
-  const medsRes = useResource<Medicine[]>("/api/medicines");
+  const medsRes = useResource<Dose[]>("/api/medicines");
   const membersRes = useResource<Member[]>("/api/members");
   const quickAdd = useAppStore((s) => s.quickAdd);
   const consumeQuickAdd = useAppStore((s) => s.consumeQuickAdd);
@@ -304,52 +321,59 @@ export function CareView() {
   const members = useMemo(() => membersRes.data ?? [], [membersRes.data]);
   const memberById = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
 
-  // Today's doses (client-local day), soonest first.
-  const todayMeds = useMemo(() => {
-    const start = startOfToday().getTime();
-    const end = new Date(startOfToday());
-    end.setDate(end.getDate() + 1);
-    return (medsRes.data ?? [])
-      .filter((m) => {
-        const t = new Date(m.scheduledAt).getTime();
-        return t >= start && t < end.getTime();
-      })
-      .sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime());
-  }, [medsRes.data]);
+  // The server already scopes GET /api/medicines to today — render it as returned.
+  const todayDoses = useMemo(
+    () => [...(medsRes.data ?? [])].sort((a, b) => new Date(a.scheduledAt).getTime() - new Date(b.scheduledAt).getTime()),
+    [medsRes.data]
+  );
 
   // Group by member, keeping the family roster order; unknown members last.
   const groups = useMemo(() => {
-    const remaining = new Map<string, Medicine[]>();
-    for (const med of todayMeds) {
-      const list = remaining.get(med.memberId);
-      if (list) list.push(med);
-      else remaining.set(med.memberId, [med]);
+    const remaining = new Map<string, Dose[]>();
+    for (const dose of todayDoses) {
+      const list = remaining.get(dose.memberId);
+      if (list) list.push(dose);
+      else remaining.set(dose.memberId, [dose]);
     }
-    const ordered: { member: Member | null; meds: Medicine[] }[] = [];
+    const ordered: { member: Member | null; doses: Dose[] }[] = [];
     for (const member of members) {
-      const meds = remaining.get(member.id);
-      if (meds) {
-        ordered.push({ member, meds });
+      const doses = remaining.get(member.id);
+      if (doses) {
+        ordered.push({ member, doses });
         remaining.delete(member.id);
       }
     }
-    for (const [id, meds] of remaining) {
-      ordered.push({ member: memberById.get(id) ?? null, meds });
+    for (const [id, doses] of remaining) {
+      ordered.push({ member: memberById.get(id) ?? null, doses });
     }
     return ordered;
-  }, [todayMeds, members, memberById]);
+  }, [todayDoses, members, memberById]);
 
-  async function act(med: Medicine, action: MedicineAction, message: string, kind: ToastKind = "success") {
+  async function act(dose: Dose, status: DoseStatus, message: string, kind: ToastKind = "success") {
     if (busyId) return;
     try {
-      setBusyId(med.id);
-      await apiSend("/api/medicines", "PATCH", { id: med.id, action });
+      setBusyId(dose.id);
+      await apiSend("/api/medicines", "PATCH", { id: dose.id, status });
       if (kind === "success") toast.success(message);
       else if (kind === "warning") toast.warning(message);
       else toast.info(message);
       await medsRes.refresh();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Something went wrong");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function removeDose(dose: Dose) {
+    if (busyId) return;
+    try {
+      setBusyId(dose.id);
+      await apiSend("/api/medicines", "DELETE", { id: dose.id });
+      toast.info(`${dose.name} at ${dose.timeLabel} deleted`);
+      await medsRes.refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not delete the dose");
     } finally {
       setBusyId(null);
     }
@@ -395,8 +419,8 @@ export function CareView() {
   if (error) {
     return (
       <div className="space-y-4">
-        <ViewTitle title="Care & Medicine" sub="Dose reminders and caregiver escalation" />
-        <EmptyState icon={<Siren className="h-10 w-10" />} title="Couldn’t load care data" sub={error} />
+        <ViewTitle title="Care & Medicine" sub="Dose reminders for your household" />
+        <EmptyState icon={<Pill className="h-10 w-10" />} title="Couldn’t load care data" sub={error} />
         <div className="flex justify-center">
           <Button
             variant="outline"
@@ -416,7 +440,7 @@ export function CareView() {
     <div className="space-y-4">
       <ViewTitle
         title="Care & Medicine"
-        sub={`Today · ${fmtDate(new Date().toISOString())} · ${todayMeds.length} dose${todayMeds.length === 1 ? "" : "s"}`}
+        sub={`Today · ${fmtDate(new Date().toISOString())} · ${todayDoses.length} dose${todayDoses.length === 1 ? "" : "s"}`}
         right={
           writable ? (
             <Button className={`h-10 px-4 text-sm ${PRIMARY_BTN}`} onClick={openAdd}>
@@ -428,7 +452,7 @@ export function CareView() {
         }
       />
 
-      {/* Honest-status banner */}
+      {/* How confirmations work — honest, no automation claims */}
       <GlassCard className="p-3 sm:p-4">
         <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-3">
           <TriangleAlert
@@ -436,8 +460,8 @@ export function CareView() {
             className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300"
           />
           <p className="text-xs font-medium leading-snug text-amber-700 dark:text-amber-300 sm:text-sm">
-            Confirmation pending is not the same as medicine missed. Caregiver acknowledgment never marks medicine as
-            taken.
+            Marking a dose taken, skipped or acknowledged records who confirmed it and when — check the
+            “Confirmed by” line under each medicine. Acknowledged is not the same as taken.
           </p>
         </div>
       </GlassCard>
@@ -446,12 +470,12 @@ export function CareView() {
       {groups.length === 0 ? (
         <EmptyState
           icon={<Pill className="h-10 w-10" />}
-          title="No doses scheduled for today"
-          sub="Use “+ Add Medicine” to set a reminder for a family member."
+          title="No medicines scheduled today"
+          sub="Use “+ Add Medicine” to plan a dose for a family member."
         />
       ) : (
-        groups.map(({ member, meds }) => (
-          <section key={member?.id ?? `unknown-${meds[0]?.id ?? "0"}`} className="space-y-2.5">
+        groups.map(({ member, doses }) => (
+          <section key={member?.id ?? `unknown-${doses[0]?.id ?? "0"}`} className="space-y-2.5">
             <div className="flex items-center gap-2.5 px-1">
               <MemberAvatar
                 name={member?.name ?? "Unknown"}
@@ -461,41 +485,43 @@ export function CareView() {
                 title={member?.name}
               />
               <div className="min-w-0">
-                <h3 className="text-sm font-bold leading-tight">{member?.name ?? "Unknown member"}</h3>
+                <h3 className="text-sm font-bold leading-tight">{member?.name ?? "Former member"}</h3>
                 <p className="text-[11px] text-muted-foreground leading-tight">
-                  {member ? member.relation : "no longer in the family"} · {meds.length} dose
-                  {meds.length === 1 ? "" : "s"} today
+                  {member ? member.relation : "no longer in the family"} · {doses.length} dose
+                  {doses.length === 1 ? "" : "s"} today
                 </p>
               </div>
             </div>
-            {meds.map((med) => (
-              <MedicineCard
-                key={med.id}
-                med={med}
+            {doses.map((dose) => (
+              <DoseCard
+                key={dose.id}
+                dose={dose}
                 member={member}
-                caregiver={caregiverFor(med, memberById)}
-                busy={busyId === med.id}
+                caregiver={caregiverFor(dose, memberById)}
+                busy={busyId === dose.id}
                 writable={writable}
-                onAct={(action, message, kind) => void act(med, action, message, kind)}
+                onAct={(status, message, kind) => void act(dose, status, message, kind)}
+                onDelete={() => void removeDose(dose)}
               />
             ))}
           </section>
         ))
       )}
 
-      {/* Escalation explainer */}
+      {/* Household note */}
       <GlassCard className="p-4">
         <div className="flex items-start gap-3">
           <span
             aria-hidden
-            className="glass-inset flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-amber-600 dark:text-amber-400"
+            className="glass-inset flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-foreground/70"
           >
-            <BellRing className="h-4 w-4" />
+            <UserRound className="h-4 w-4" />
           </span>
           <div className="min-w-0">
-            <p className="text-sm font-semibold">Escalation automation</p>
+            <p className="text-sm font-semibold">Everyone sees the same list</p>
             <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-              Reminder → repeat at +30s → notify caregiver → escalate to next caregiver. Stops when handled.
+              Doses shown here are scheduled for today across your household. Any member with write access can
+              confirm a dose, and their name is recorded with it.
             </p>
           </div>
         </div>
@@ -515,7 +541,8 @@ export function CareView() {
               <Pill className="h-4 w-4 text-primary" /> Add medicine reminder
             </DialogTitle>
             <DialogDescription>
-              Set a dose for a family member. If no confirmation arrives, automation escalates to the caregiver.
+              Schedule a dose for a family member. It appears for the whole household today and can be
+              confirmed with a name attached.
             </DialogDescription>
           </DialogHeader>
           <div className="grid max-h-[60vh] gap-3.5 overflow-y-auto py-1 pr-1 scrollbar-slim">
@@ -568,7 +595,7 @@ export function CareView() {
                 <Label>Caregiver (optional)</Label>
                 <Select value={form.caregiverId} onValueChange={(v) => setForm({ ...form, caregiverId: v })}>
                   <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Who gets alerted?" />
+                    <SelectValue placeholder="Who to list as caregiver?" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">No caregiver</SelectItem>

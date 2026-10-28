@@ -1,20 +1,25 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
 
 export const dynamic = "force-dynamic";
 
-/** GET /api/activity — latest 30 activity entries, newest first. */
-export async function GET() {
-  try {
-    await ensureSeed();
-    const activity = await db.activityLog.findMany({
-      orderBy: { createdAt: "desc" },
-      take: 30,
-    });
-    return NextResponse.json(activity);
-  } catch (e) {
-    console.error("GET /api/activity failed:", e);
-    return NextResponse.json({ error: "Failed to load activity" }, { status: 500 });
-  }
+/** GET /api/activity — the family's real activity feed. */
+export async function GET(req: NextRequest) {
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const entries = await db.activityLog.findMany({
+    where: { familyId: ctx.familyId },
+    orderBy: { createdAt: "desc" },
+    take: 30,
+  });
+  return NextResponse.json(
+    entries.map((a) => ({
+      id: a.id,
+      actor: a.actor,
+      action: a.action,
+      target: a.target,
+      createdAt: a.createdAt.toISOString(),
+    }))
+  );
 }

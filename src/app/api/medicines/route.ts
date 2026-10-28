@@ -1,214 +1,133 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { logActivity } from "@/lib/homesync/server";
+import { readJson } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
-const ACTIONS = ["take", "skip", "miss", "escalate", "acknowledge", "reset"] as const;
-type MedicineAction = (typeof ACTIONS)[number];
-
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  const body = await req.json().catch(() => null);
-  return body && typeof body === "object" && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : null;
+function serialize(m: {
+  id: string; memberId: string; caregiverId: string | null; name: string; dosage: string;
+  timeLabel: string; instructions: string | null; status: string;
+  scheduledAt: Date; actedAt: Date | null; actedBy: string | null; createdAt: Date;
+}) {
+  return {
+    id: m.id,
+    memberId: m.memberId,
+    caregiverId: m.caregiverId,
+    name: m.name,
+    dosage: m.dosage,
+    timeLabel: m.timeLabel,
+    instructions: m.instructions,
+    status: m.status,
+    scheduledAt: m.scheduledAt.toISOString(),
+    actedAt: m.actedAt?.toISOString() ?? null,
+    actedBy: m.actedBy,
+    createdAt: m.createdAt.toISOString(),
+  };
 }
 
-/** Parse "H:MM AM/PM" (e.g. "8:00 AM", "6:30 pm") into 24h hours/minutes. */
-function parseTimeLabel(label: string): { h: number; m: number } | null {
-  const match = /^(\d{1,2}):(\d{2})\s*([AP]M)$/i.exec(label.trim());
-  if (!match) return null;
-  let h = parseInt(match[1], 10);
-  const m = parseInt(match[2], 10);
-  const ap = match[3].toUpperCase();
-  if (h < 1 || h > 12 || m > 59) return null;
-  if (ap === "PM" && h !== 12) h += 12;
-  if (ap === "AM" && h === 12) h = 0;
-  return { h, m };
-}
-
-function fmtTime(d: Date): string {
-  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
-}
-
-/** GET /api/medicines?date=ISO — medicines scheduled on that date (or all), ordered scheduledAt asc. */
+/** GET /api/medicines?date=ISO — doses scheduled for a day (default: today, family timezone-agnostic). */
 export async function GET(req: NextRequest) {
-  try {
-    await ensureSeed();
-    const dateParam = req.nextUrl.searchParams.get("date");
-    const where: { scheduledAt?: { gte: Date; lt: Date } } = {};
-    if (dateParam) {
-      const d = new Date(dateParam);
-      if (Number.isNaN(d.getTime())) {
-        return NextResponse.json({ error: "date must be a valid ISO date" }, { status: 400 });
-      }
-      const start = new Date(d);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
-      end.setDate(end.getDate() + 1);
-      where.scheduledAt = { gte: start, lt: end };
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const medicines = await db.medicine.findMany({ where, orderBy: { scheduledAt: "asc" } });
-    return NextResponse.json(medicines);
-  } catch (e) {
-    console.error("GET /api/medicines failed:", e);
-    return NextResponse.json({ error: "Failed to load medicines" }, { status: 500 });
+  const dateParam = req.nextUrl.searchParams.get("date");
+  const base = dateParam ? new Date(dateParam) : new Date();
+  if (Number.isNaN(base.getTime())) {
+    return NextResponse.json({ error: "Invalid date." }, { status: 400 });
   }
+  const dayStart = new Date(base.getFullYear(), base.getMonth(), base.getDate());
+  const dayEnd = new Date(dayStart.getTime() + 24 * 3600 * 1000);
+
+  const medicines = await db.medicine.findMany({
+    where: { familyId: ctx.familyId, scheduledAt: { gte: dayStart, lt: dayEnd } },
+    orderBy: { scheduledAt: "asc" },
+    take: 200,
+  });
+  return NextResponse.json(medicines.map(serialize));
 }
 
-/** POST /api/medicines — schedule a medicine dose. */
+/** POST /api/medicines — schedule a dose (real user-entered data only; AI never creates dosages). */
 export async function POST(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    if (typeof body.name !== "string" || !body.name.trim()) {
-      return NextResponse.json({ error: "name is required" }, { status: 400 });
-    }
-    if (typeof body.memberId !== "string" || !body.memberId) {
-      return NextResponse.json({ error: "memberId is required" }, { status: 400 });
-    }
-    const member = await db.member.findUnique({ where: { id: body.memberId } });
-    if (!member) {
-      return NextResponse.json({ error: "memberId must reference an existing member" }, { status: 400 });
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const timeLabelIn = typeof body.timeLabel === "string" ? body.timeLabel.trim() : "";
-    if (timeLabelIn && !parseTimeLabel(timeLabelIn)) {
-      return NextResponse.json(
-        { error: "timeLabel must look like \"8:00 AM\"" },
-        { status: 400 }
-      );
-    }
-
-    let scheduledAt: Date;
-    if (typeof body.scheduledAt === "string" && body.scheduledAt) {
-      scheduledAt = new Date(body.scheduledAt);
-      if (Number.isNaN(scheduledAt.getTime())) {
-        return NextResponse.json({ error: "scheduledAt must be a valid ISO datetime" }, { status: 400 });
-      }
-    } else {
-      scheduledAt = new Date();
-      const parsed = timeLabelIn ? parseTimeLabel(timeLabelIn) : null;
-      if (parsed) scheduledAt.setHours(parsed.h, parsed.m, 0, 0);
-    }
-
-    const timeLabel = timeLabelIn || fmtTime(scheduledAt);
-
-    const created = await db.medicine.create({
-      data: {
-        name: body.name.trim(),
-        dosage: typeof body.dosage === "string" && body.dosage.trim() ? body.dosage.trim() : "1 dose",
-        timeLabel,
-        instructions: typeof body.instructions === "string" ? body.instructions : null,
-        memberId: body.memberId,
-        caregiverId: typeof body.caregiverId === "string" ? body.caregiverId : null,
-        scheduledAt,
-      },
-    });
-    return NextResponse.json(created, { status: 201 });
-  } catch (e) {
-    console.error("POST /api/medicines failed:", e);
-    return NextResponse.json({ error: "Failed to create medicine" }, { status: 500 });
+  const body = await readJson(req);
+  const name = String(body.name ?? "").trim().slice(0, 80);
+  const memberId = String(body.memberId ?? "");
+  const dosage = String(body.dosage ?? "").trim().slice(0, 40) || "1 dose";
+  const timeLabel = String(body.timeLabel ?? "").trim().slice(0, 20);
+  const scheduledAt = new Date(String(body.scheduledAt ?? ""));
+  if (!name || !memberId || !timeLabel || Number.isNaN(scheduledAt.getTime())) {
+    return NextResponse.json({ error: "Medicine needs a name, person, time and schedule." }, { status: 400 });
   }
+  const person = await db.member.findUnique({ where: { id: memberId } });
+  if (!person || person.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "That person is not part of your family." }, { status: 404 });
+  }
+
+  const medicine = await db.medicine.create({
+    data: {
+      familyId: ctx.familyId,
+      memberId,
+      caregiverId: typeof body.caregiverId === "string" && body.caregiverId ? body.caregiverId : null,
+      name,
+      dosage,
+      timeLabel,
+      instructions: typeof body.instructions === "string" && body.instructions.trim() ? body.instructions.trim().slice(0, 200) : null,
+      scheduledAt,
+    },
+  });
+  await logActivity(ctx.familyId, ctx.user, "scheduled medicine", `${name} for ${person.name}`);
+  return NextResponse.json({ medicine: serialize(medicine) });
 }
 
-/** PATCH /api/medicines — { id, action } state machine for dose confirmations. */
+/**
+ * PATCH /api/medicines — record dose actions (taken / skipped / acknowledged).
+ * The actor is always the signed-in user from the session — never fabricated.
+ */
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
-    const action = body.action as MedicineAction;
-    if (!ACTIONS.includes(action)) {
-      return NextResponse.json(
-        { error: `action must be one of: ${ACTIONS.join(", ")}` },
-        { status: 400 }
-      );
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.medicine.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Medicine not found" }, { status: 404 });
-
-    const target = `${existing.name} ${existing.timeLabel}`;
-
-    switch (action) {
-      case "take": {
-        const member = await db.member.findUnique({ where: { id: existing.memberId } });
-        const updated = await db.medicine.update({ where: { id }, data: { status: "taken" } });
-        await db.activityLog.create({
-          data: { actor: member?.name ?? req.headers.get("X-HS-Actor") ?? "Family", action: "confirmed medicine", target },
-        });
-        return NextResponse.json(updated);
-      }
-      case "skip": {
-        const updated = await db.medicine.update({ where: { id }, data: { status: "skipped" } });
-        return NextResponse.json(updated);
-      }
-      case "miss": {
-        // Simulates "no response detected" from the elder.
-        const updated = await db.medicine.update({
-          where: { id },
-          data: { status: "confirmation_pending" },
-        });
-        return NextResponse.json(updated);
-      }
-      case "escalate": {
-        const updated = await db.medicine.update({
-          where: { id },
-          data: { status: "escalated", escalatedToId: existing.caregiverId ?? null },
-        });
-        await db.activityLog.create({
-          data: { actor: "System", action: "escalated reminder to caregiver for", target },
-        });
-        return NextResponse.json(updated);
-      }
-      case "acknowledge": {
-        // Caregiver acknowledgment ≠ medicine confirmed — status stays "acknowledged".
-        const caregiver = existing.caregiverId
-          ? await db.member.findUnique({ where: { id: existing.caregiverId } })
-          : null;
-        const updated = await db.medicine.update({
-          where: { id },
-          data: { status: "acknowledged" },
-        });
-        await db.activityLog.create({
-          data: { actor: caregiver?.name ?? "Caregiver", action: "acknowledged alert for", target },
-        });
-        return NextResponse.json(updated);
-      }
-      case "reset": {
-        const updated = await db.medicine.update({
-          where: { id },
-          data: { status: "scheduled", escalatedToId: null },
-        });
-        return NextResponse.json(updated);
-      }
-    }
-  } catch (e) {
-    console.error("PATCH /api/medicines failed:", e);
-    return NextResponse.json({ error: "Failed to update medicine" }, { status: 500 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const medicine = await db.medicine.findUnique({ where: { id } });
+  if (!medicine || medicine.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Medicine not found." }, { status: 404 });
   }
+
+  const STATUSES = new Set(["scheduled", "taken", "skipped", "acknowledged"]);
+  const status = String(body.status ?? "");
+  if (!STATUSES.has(status)) {
+    return NextResponse.json({ error: "Unknown status." }, { status: 400 });
+  }
+
+  const updated = await db.medicine.update({
+    where: { id },
+    data: { status, actedAt: new Date(), actedBy: ctx.user.name },
+  });
+  const person = await db.member.findUnique({ where: { id: updated.memberId } });
+  await logActivity(
+    ctx.familyId,
+    ctx.user,
+    status === "taken" ? "confirmed medicine taken" : `marked dose ${status}`,
+    `${updated.name} ${updated.timeLabel}${person ? ` • ${person.name}` : ""}`
+  );
+  return NextResponse.json({ medicine: serialize(updated) });
 }
 
-/** DELETE /api/medicines — remove a medicine by id (JSON body, searchParams fallback). */
+/** DELETE /api/medicines */
 export async function DELETE(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    const id =
-      (body && typeof body.id === "string" ? body.id : "") ||
-      req.nextUrl.searchParams.get("id") ||
-      "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
-
-    const existing = await db.medicine.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Medicine not found" }, { status: 404 });
-
-    await db.medicine.delete({ where: { id } });
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /api/medicines failed:", e);
-    return NextResponse.json({ error: "Failed to delete medicine" }, { status: 500 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const medicine = await db.medicine.findUnique({ where: { id } });
+  if (!medicine || medicine.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Medicine not found." }, { status: 404 });
   }
+  await db.medicine.delete({ where: { id } });
+  return NextResponse.json({ ok: true });
 }

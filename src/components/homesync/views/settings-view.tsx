@@ -3,11 +3,9 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useTheme } from "next-themes";
 import {
-  Bell,
   Check,
-  Download,
   Loader2,
-  Lock,
+  LogOut,
   MapPin,
   Monitor,
   Moon,
@@ -19,56 +17,64 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
-import type { Member, SessionUser } from "@/lib/homesync/types";
-import { useResource } from "@/lib/homesync/api";
+import { apiSend, useResource } from "@/lib/homesync/api";
 import { useAppStore } from "@/lib/homesync/store";
 import { useSession } from "@/lib/homesync/session";
+import type { FamilyInfo } from "@/lib/homesync/types";
 import { Chip, GlassCard, MemberAvatar, SectionHeader, ViewTitle } from "@/components/homesync/glass";
-import { HomeSyncMark, ShieldUserIcon } from "@/components/homesync/icons";
+import { HomeSyncMark } from "@/components/homesync/icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 
-const CAPACITY = 8;
-
-const ROLE_OPTIONS = ["Family Admin", "Parent", "Senior Member", "Child"];
-
-/** Hydration-safe "client mounted" flag (no setState-in-effect). */
-const subscribeNoop = () => () => {};
-function useMounted(): boolean {
-  return useSyncExternalStore(
-    subscribeNoop,
-    () => true,
-    () => false
-  );
+/** Shape returned by GET /api/family (membership + family + raw household profiles). */
+interface FamilyResponse {
+  membership: { role: string; status: string } | null;
+  family: FamilyInfo | null;
+  members: {
+    id: string;
+    name: string;
+    role: string;
+    color: string;
+    photoUrl: string | null;
+    userId: string | null;
+    locationSharing: boolean;
+  }[];
 }
 
-const THEME_OPTIONS: { value: "light" | "dark" | "system"; icon: LucideIcon; label: string }[] = [
-  { value: "light", icon: Sun, label: "Light" },
-  { value: "dark", icon: Moon, label: "Dark" },
-  { value: "system", icon: Monitor, label: "System" },
-];
+/** The slice of useResource<T> the cards below need. */
+interface FamilyResource {
+  data: FamilyResponse | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+}
 
-const NOTIFICATION_ROWS: { key: string; label: string; helper: string }[] = [
-  { key: "morning", label: "Daily morning summary", helper: "A calm digest of the day, every morning" },
-  { key: "bills", label: "Bill reminders", helper: "Before each due date" },
-  { key: "medicine", label: "Medicine escalations", helper: "When a dose needs attention" },
-  { key: "activity", label: "Family activity", helper: "Tasks, events and purchases" },
-];
-
-/* ---------- Minimalist On/Off segmented control (no Switch components) ---------- */
+/* ---------- Minimalist On/Off segmented control ---------- */
 
 function OnOffSegmented({
   label,
   value,
   onChange,
+  disabled,
 }: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   const options: { text: string; next: boolean }[] = [
     { text: "Off", next: false },
@@ -85,9 +91,10 @@ function OnOffSegmented({
           key={opt.text}
           type="button"
           aria-pressed={value === opt.next}
+          disabled={disabled}
           onClick={() => onChange(opt.next)}
           className={cn(
-            "min-w-11 rounded-full px-3 py-1.5 text-xs font-semibold leading-none transition-colors",
+            "min-w-11 rounded-full px-3 py-1.5 text-xs font-semibold leading-none transition-colors disabled:opacity-60",
             value === opt.next
               ? "brand-gradient text-white shadow-sm"
               : "text-muted-foreground hover:text-foreground"
@@ -100,67 +107,43 @@ function OnOffSegmented({
   );
 }
 
-function SettingRow({
-  label,
-  helper,
-  value,
-  onChange,
-}: {
-  label: string;
-  helper?: string;
-  value: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <div className="min-w-0">
-        <p className="text-sm font-medium leading-tight">{label}</p>
-        {helper ? <p className="mt-0.5 text-xs text-muted-foreground">{helper}</p> : null}
-      </div>
-      <OnOffSegmented label={label} value={value} onChange={onChange} />
-    </div>
+/** Hydration-safe "client mounted" flag (no setState-in-effect). */
+const subscribeNoop = () => () => {};
+function useMounted(): boolean {
+  return useSyncExternalStore(
+    subscribeNoop,
+    () => true,
+    () => false
   );
 }
 
-/* ---------- My profile (self-editable until the Family Admin locks it) ---------- */
+/* ---------- My profile (server: PATCH /api/auth/profile) ---------- */
 
-function ProfileCard({
-  user,
-  onSaved,
-}: {
-  user: SessionUser;
-  onSaved: (patch: { name: string; role: string }) => void;
-}) {
-  const [name, setName] = useState(user.name);
-  const [role, setRole] = useState(user.role);
+function ProfileCard() {
+  const user = useSession((s) => s.user);
+  const updateUser = useSession((s) => s.updateUser);
+  const [name, setName] = useState(user?.name ?? "");
   const [busy, setBusy] = useState(false);
 
-  async function save() {
-    if (busy || !user.email) return;
+  if (!user) return null;
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy) return;
     const nextName = name.trim();
     if (!nextName) {
       toast.error("Enter a display name to continue.");
       return;
     }
-    setBusy(true);
     try {
-      const res = await fetch("/api/auth/me", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: user.email, name: nextName, role }),
+      setBusy(true);
+      const res = await apiSend<{ user: { id: string; name: string } }>("/api/auth/profile", "PATCH", {
+        name: nextName,
       });
-      const data = (await res.json().catch(() => ({}))) as {
-        user?: SessionUser;
-        error?: string;
-      };
-      if (!res.ok || !data.user) {
-        toast.error(data.error ?? "Could not update your profile.");
-        return;
-      }
-      onSaved({ name: data.user.name, role: data.user.role });
+      updateUser({ name: res.user.name });
       toast.success("Profile updated");
-    } catch {
-      toast.error("Could not update your profile.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not update your profile.");
     } finally {
       setBusy(false);
     }
@@ -179,79 +162,236 @@ function ProfileCard({
         <Chip tone="brand">{user.role}</Chip>
       </div>
 
-      {user.profileLocked ? (
-        <div className="space-y-3">
-          <div className="rounded-xl border border-border/70 bg-muted/40 p-3">
-            <Chip>
-              <Lock className="h-3 w-3" /> Locked by your Family Admin
-            </Chip>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              Only your Family Admin can change your name or role now. Ask them to make the change for you.
-            </p>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          void save(e);
+        }}
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="profile-name">Display name</Label>
+            <Input
+              id="profile-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={60}
+              autoComplete="name"
+              disabled={busy}
+              className="h-10 rounded-xl bg-background/50"
+            />
           </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <Label htmlFor="profile-name-locked">Display name</Label>
-              <Input
-                id="profile-name-locked"
-                value={user.name}
-                readOnly
-                disabled
-                className="h-10 rounded-xl bg-background/50"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="profile-role-locked">Role</Label>
-              <Input
-                id="profile-role-locked"
-                value={user.role}
-                readOnly
-                disabled
-                className="h-10 rounded-xl bg-background/50"
-              />
-            </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="profile-email">Email</Label>
+            <Input
+              id="profile-email"
+              value={user.email ?? ""}
+              readOnly
+              disabled
+              className="h-10 rounded-xl bg-background/50"
+            />
+            <p className="text-[10px] text-muted-foreground">Signed in with Google — this can&apos;t be changed.</p>
           </div>
         </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-role">Role</Label>
+          <Input
+            id="profile-role"
+            value={user.role}
+            readOnly
+            disabled
+            className="h-10 rounded-xl bg-background/50"
+          />
+          <p className="text-[10px] text-muted-foreground">Your role is set by the Family Admin.</p>
+        </div>
+        <Button
+          type="submit"
+          disabled={busy || name.trim() === user.name || name.trim().length === 0}
+          className="brand-gradient h-10 rounded-xl text-white shadow-md"
+        >
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+          Save profile
+        </Button>
+      </form>
+    </GlassCard>
+  );
+}
+
+/* ---------- Family settings (server: PATCH /api/family — admin only) ---------- */
+
+function FamilyAdminCard({ familyRes }: { familyRes: FamilyResource }) {
+  const hydrate = useSession((s) => s.hydrate);
+  const family = familyRes.data?.family ?? null;
+  const activeAccounts = (familyRes.data?.members ?? []).filter((m) => m.userId !== null).length;
+
+  const [name, setName] = useState("");
+  const [homeLabel, setHomeLabel] = useState("");
+  const [lat, setLat] = useState("");
+  const [lng, setLng] = useState("");
+  const [capacity, setCapacity] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [seededKey, setSeededKey] = useState<string | null>(null);
+
+  // Reseed only when the SERVER values actually change — never while the admin
+  // is typing (background refetches keep the same values), and always after a
+  // save so server-clamped values (e.g. capacity) show up.
+  const familyKey = family
+    ? `${family.id}:${family.name}:${family.homeLabel ?? ""}:${family.homeLat ?? ""}:${family.homeLng ?? ""}:${family.capacity}`
+    : null;
+  useEffect(() => {
+    if (family && familyKey && seededKey !== familyKey) {
+      setName(family.name);
+      setHomeLabel(family.homeLabel ?? "");
+      setLat(family.homeLat === null ? "" : String(family.homeLat));
+      setLng(family.homeLng === null ? "" : String(family.homeLng));
+      setCapacity(String(family.capacity));
+      setSeededKey(familyKey);
+    }
+  }, [family, familyKey, seededKey]);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (!family || saving) return;
+    const cap = Math.trunc(Number(capacity));
+    if (!Number.isFinite(cap) || cap < 1) {
+      toast.error("Capacity must be a whole number of at least 1.");
+      return;
+    }
+    const latNum = lat.trim() === "" ? null : Number(lat);
+    const lngNum = lng.trim() === "" ? null : Number(lng);
+    if (latNum !== null && (!Number.isFinite(latNum) || latNum < -90 || latNum > 90)) {
+      toast.error("Home latitude must be a number between -90 and 90.");
+      return;
+    }
+    if (lngNum !== null && (!Number.isFinite(lngNum) || lngNum < -180 || lngNum > 180)) {
+      toast.error("Home longitude must be a number between -180 and 180.");
+      return;
+    }
+    try {
+      setSaving(true);
+      await apiSend("/api/family", "PATCH", {
+        name: name.trim(),
+        homeLabel: homeLabel.trim(),
+        homeLat: latNum,
+        homeLng: lngNum,
+        capacity: cap,
+      });
+      toast.success("Family settings saved");
+      await hydrate(); // refresh the session's family cache
+      await familyRes.refresh(); // reseed happens when the fresh values arrive
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not save family settings.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <GlassCard className="space-y-4 p-4 sm:p-5">
+      <SectionHeader
+        icon={<UsersRound className="h-4 w-4" />}
+        title="Family"
+        sub="Household name, home place and capacity"
+        action={<Chip tone="brand">Admin</Chip>}
+      />
+
+      {!family ? (
+        familyRes.error ? (
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2">
+            <p className="text-xs font-medium text-red-600 dark:text-red-400">{familyRes.error}</p>
+            <Button variant="outline" size="sm" className="h-7 rounded-full px-3 text-xs" onClick={() => void familyRes.refresh()}>
+              Retry
+            </Button>
+          </div>
+        ) : (
+          <p className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading family settings…
+          </p>
+        )
       ) : (
         <form
-          className="space-y-3"
+          className="space-y-3.5"
           onSubmit={(e) => {
-            e.preventDefault();
-            void save();
+            void save(e);
           }}
         >
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="profile-name">Display name</Label>
+              <Label htmlFor="family-name">Family name</Label>
               <Input
-                id="profile-name"
+                id="family-name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 maxLength={60}
-                autoComplete="name"
-                disabled={busy}
+                disabled={saving}
                 className="h-10 rounded-xl bg-background/50"
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="profile-role">Role</Label>
-              <Select value={role} onValueChange={setRole} disabled={busy}>
-                <SelectTrigger id="profile-role" className="h-10 w-full rounded-xl">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {ROLE_OPTIONS.map((r) => (
-                    <SelectItem key={r} value={r}>
-                      {r}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <Label htmlFor="family-home-label">Home label</Label>
+              <Input
+                id="family-home-label"
+                value={homeLabel}
+                onChange={(e) => setHomeLabel(e.target.value)}
+                maxLength={80}
+                placeholder="e.g. 24 Lakeview Avenue"
+                disabled={saving}
+                className="h-10 rounded-xl bg-background/50"
+              />
             </div>
           </div>
-          <Button type="submit" disabled={busy} className="brand-gradient h-10 rounded-xl text-white shadow-md">
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-            Save profile
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="family-lat">Home latitude</Label>
+              <Input
+                id="family-lat"
+                type="number"
+                step="any"
+                min={-90}
+                max={90}
+                value={lat}
+                onChange={(e) => setLat(e.target.value)}
+                placeholder="13.0827"
+                disabled={saving}
+                className="h-10 rounded-xl bg-background/50"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="family-lng">Home longitude</Label>
+              <Input
+                id="family-lng"
+                type="number"
+                step="any"
+                min={-180}
+                max={180}
+                value={lng}
+                onChange={(e) => setLng(e.target.value)}
+                placeholder="80.2707"
+                disabled={saving}
+                className="h-10 rounded-xl bg-background/50"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="family-capacity">Member capacity</Label>
+              <Input
+                id="family-capacity"
+                type="number"
+                min={Math.max(1, activeAccounts)}
+                max={24}
+                value={capacity}
+                onChange={(e) => setCapacity(e.target.value)}
+                disabled={saving}
+                className="h-10 rounded-xl bg-background/50"
+              />
+            </div>
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Coordinates power weather and the family map — leave one empty to clear it. Capacity can&apos;t go below
+            the {activeAccounts} active member{activeAccounts === 1 ? "" : "s"}.
+          </p>
+          <Button type="submit" disabled={saving} className="brand-gradient h-10 rounded-xl text-white shadow-md">
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+            Save family settings
           </Button>
         </form>
       )}
@@ -259,236 +399,256 @@ function ProfileCard({
   );
 }
 
-/* ---------- Settings view ---------- */
+/* ---------- Privacy (real consent toggle + real history deletion) ---------- */
 
-export function SettingsView() {
-  // Signed-in user (profile card + session updates)
+function PrivacyCard({ familyRes }: { familyRes: FamilyResource }) {
   const user = useSession((s) => s.user);
-  const updateUser = useSession((s) => s.updateUser);
+  const members = familyRes.data?.members ?? [];
+  const myProfile = user ? (members.find((m) => m.userId === user.id) ?? null) : null;
 
-  // Theme (mounted guard avoids hydration mismatch)
-  const { theme, setTheme } = useTheme();
-  const mounted = useMounted();
+  const [toggling, setToggling] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
-  // Elderly-friendly mode (persisted in the app store)
-  const elderlyMode = useAppStore((s) => s.elderlyMode);
-  const setElderlyMode = useAppStore((s) => s.setElderlyMode);
-  useEffect(() => {
-    document.documentElement.classList.toggle("elderly", elderlyMode);
-  }, [elderlyMode]);
+  async function toggleSharing(on: boolean) {
+    if (!myProfile || toggling) return;
+    try {
+      setToggling(true);
+      await apiSend("/api/members", "PATCH", { id: myProfile.id, locationSharing: on });
+      toast.success(on ? "Location sharing is on" : "Location sharing is off");
+      await familyRes.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not update location sharing.");
+    } finally {
+      setToggling(false);
+    }
+  }
 
-  // Family list (read-only summary)
-  const {
-    data: members,
-    loading: membersLoading,
-    error: membersError,
-  } = useResource<Member[]>("/api/members");
-  const memberList = members ?? [];
-  const capacityPct = Math.min(100, Math.round((memberList.length / CAPACITY) * 100));
-
-  // Local preference state (client-only, not persisted)
-  const [familyName, setFamilyName] = useState("Our Home");
-  const [shareLocation, setShareLocation] = useState(true);
-  const [recordLocation, setRecordLocation] = useState(true);
-  const [approxOnly, setApproxOnly] = useState(false);
-  const [retention, setRetention] = useState("30");
-  const [notifications, setNotifications] = useState<Record<string, boolean>>({
-    morning: true,
-    bills: true,
-    medicine: true,
-    activity: true,
-  });
+  async function deleteHistory() {
+    if (deleting) return;
+    try {
+      setDeleting(true);
+      await apiSend("/api/location", "DELETE");
+      toast.success("Your location history was deleted");
+      setConfirmOpen(false);
+      await familyRes.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not delete your location history.");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
-    <div className="max-w-3xl space-y-4">
-      <ViewTitle title="Settings" sub="Your profile, appearance, family, privacy and more" />
+    <GlassCard className="space-y-4 p-4 sm:p-5">
+      <SectionHeader icon={<MapPin className="h-4 w-4" />} title="Privacy" sub="You control what your family sees" />
 
-      {/* My profile */}
-      {user ? (
-        user.isGuest ? (
-          <p className="flex items-center gap-1.5 px-1 text-xs text-muted-foreground">
-            <ShieldUserIcon size={14} /> Guests can&apos;t edit a profile
-          </p>
-        ) : (
-          <ProfileCard key={user.id} user={user} onSaved={(patch) => updateUser(patch)} />
-        )
-      ) : null}
-
-      {/* Appearance */}
-      <GlassCard className="space-y-5 p-4 sm:p-5">
-        <SectionHeader icon={<Palette className="h-4 w-4" />} title="Appearance" sub="Make HOME SYNC feel like yours" />
-        <div>
-          <Label className="text-xs font-medium text-muted-foreground">Theme</Label>
-          <RadioGroup
-            value={mounted ? theme : undefined}
-            onValueChange={setTheme}
-            className="mt-2 grid grid-cols-3 gap-2"
-          >
-            {THEME_OPTIONS.map((t) => {
-              const selected = mounted && theme === t.value;
-              return (
-                <Label
-                  key={t.value}
-                  htmlFor={`theme-${t.value}`}
-                  className={cn(
-                    "flex cursor-pointer flex-col items-center gap-1.5 rounded-xl border px-2 py-3 text-xs font-medium transition-colors",
-                    selected
-                      ? "border-primary/50 bg-primary/10 text-primary"
-                      : "border-border/70 text-muted-foreground hover:bg-muted/60"
-                  )}
-                >
-                  <RadioGroupItem id={`theme-${t.value}`} value={t.value} className="sr-only" />
-                  <t.icon className="h-5 w-5" aria-hidden />
-                  {t.label}
-                </Label>
-              );
-            })}
-          </RadioGroup>
-        </div>
+      {familyRes.error ? (
+        <p className="text-xs text-red-500">Couldn&apos;t load your profile: {familyRes.error}</p>
+      ) : myProfile ? (
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-sm font-medium leading-tight">Elderly-friendly mode</p>
-            <p className="mt-0.5 text-xs text-muted-foreground">Bigger text and buttons across the app</p>
+            <p className="text-sm font-medium leading-tight">Share my location with family</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Only your device records positions, and only while sharing is on
+            </p>
           </div>
           <OnOffSegmented
-            label="Elderly-friendly mode"
-            value={mounted && elderlyMode}
-            onChange={(v) => setElderlyMode(v)}
+            label="Share my location with family"
+            value={myProfile.locationSharing}
+            disabled={toggling || familyRes.loading}
+            onChange={(v) => void toggleSharing(v)}
           />
         </div>
-      </GlassCard>
+      ) : familyRes.loading ? (
+        <p className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading your profile…
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          No household profile is linked to your account, so there is no location sharing to configure.
+        </p>
+      )}
 
-      {/* Family */}
-      <GlassCard className="space-y-4 p-4 sm:p-5">
-        <SectionHeader icon={<UsersRound className="h-4 w-4" />} title="Family" sub="The people who share this home" />
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <Input
-            id="family-name"
-            value={familyName}
-            onChange={(e) => setFamilyName(e.target.value)}
-            aria-label="Family name"
-            className="glass-inset border-0 focus-visible:ring-primary/40"
-          />
-          <Button
-            className="brand-gradient shrink-0 border-0 text-white shadow-md"
-            onClick={() => toast.success("Saved")}
-          >
-            Save
-          </Button>
-        </div>
-        <div className="space-y-2.5">
-          <div className="flex items-center justify-between gap-3">
-            {membersError ? (
-              <p className="text-xs text-red-500">Couldn&apos;t load members: {membersError}</p>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                {membersLoading ? "Loading members…" : `${memberList.length} members • capacity ${CAPACITY}`}
-              </p>
-            )}
-            {!membersError && memberList.length > 0 ? (
-              <div className="flex shrink-0 -space-x-2">
-                {memberList.slice(0, CAPACITY).map((m) => (
-                  <MemberAvatar
-                    key={m.id}
-                    name={m.name}
-                    color={m.color}
-                    role={m.role}
-                    size={26}
-                    className="ring-2 ring-background"
-                    title={`${m.name} • ${m.role}`}
-                  />
-                ))}
-              </div>
-            ) : null}
-          </div>
-          <div
-            className="h-2 w-full overflow-hidden rounded-full bg-muted"
-            role="progressbar"
-            aria-label="Family capacity"
-            aria-valuemin={0}
-            aria-valuemax={CAPACITY}
-            aria-valuenow={memberList.length}
-          >
-            <div
-              className="brand-gradient h-full rounded-full transition-all"
-              style={{ width: `${capacityPct}%` }}
-            />
-          </div>
-        </div>
-      </GlassCard>
-
-      {/* Location & privacy */}
-      <GlassCard className="space-y-4 p-4 sm:p-5">
-        <SectionHeader icon={<MapPin className="h-4 w-4" />} title="Location & privacy" sub="You control what your family sees" />
-        <SettingRow
-          label="Share my location with family"
-          value={shareLocation}
-          onChange={setShareLocation}
-        />
-        <SettingRow
-          label="Record location every 30 minutes"
-          helper="Background limits apply — recording may pause when the app is closed"
-          value={recordLocation}
-          onChange={setRecordLocation}
-        />
-        <SettingRow
-          label="Approximate location only"
-          value={approxOnly}
-          onChange={setApproxOnly}
-        />
-        <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <Label htmlFor="location-retention" className="text-sm font-medium leading-tight">
-              Location history retention
-            </Label>
-            <p className="mt-0.5 text-xs text-muted-foreground">How long past locations are kept</p>
-          </div>
-          <Select value={retention} onValueChange={setRetention}>
-            <SelectTrigger id="location-retention" className="w-32">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="30">30 days</SelectItem>
-              <SelectItem value="90">90 days</SelectItem>
-              <SelectItem value="365">1 year</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-3">
-          <p className="mb-2 text-xs font-semibold text-red-600 dark:text-red-400">Danger zone</p>
-          <div className="flex flex-wrap gap-2">
+      <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-3">
+        <p className="mb-1.5 text-xs font-semibold text-red-600 dark:text-red-400">Danger zone</p>
+        <p className="mb-2.5 text-[11px] leading-relaxed text-muted-foreground">
+          Deleting your location history removes every recorded position for your profile. This cannot be undone.
+        </p>
+        <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+          <AlertDialogTrigger asChild>
             <Button
               variant="outline"
               size="sm"
               className="border-red-500/40 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-              onClick={() => toast.success("Location history cleared")}
+              disabled={deleting}
             >
               <Trash2 className="h-4 w-4" /> Delete my location history
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => toast("Export will be emailed when storage integration is connected")}
-            >
-              <Download className="h-4 w-4" /> Export family data
-            </Button>
-          </div>
-        </div>
-      </GlassCard>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete your location history?</AlertDialogTitle>
+              <AlertDialogDescription>
+                Every recorded location linked to your profile will be permanently removed from the server. New
+                positions will only be recorded if location sharing is on.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-red-600 text-white hover:bg-red-600/90"
+                disabled={deleting}
+                onClick={(e) => {
+                  e.preventDefault();
+                  void deleteHistory();
+                }}
+              >
+                {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                Delete history
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    </GlassCard>
+  );
+}
 
-      {/* Notifications */}
-      <GlassCard className="space-y-3.5 p-4 sm:p-5">
-        <SectionHeader icon={<Bell className="h-4 w-4" />} title="Notifications" sub="Stay in the loop, calmly" />
-        {NOTIFICATION_ROWS.map((row) => (
-          <SettingRow
-            key={row.key}
-            label={row.label}
-            helper={row.helper}
-            value={notifications[row.key] ?? false}
-            onChange={(v) => setNotifications((prev) => ({ ...prev, [row.key]: v }))}
-          />
-        ))}
-      </GlassCard>
+/* ---------- Appearance (theme + elderly mode — unchanged behavior) ---------- */
+
+const THEME_OPTIONS: { value: "light" | "dark" | "system"; icon: LucideIcon; label: string }[] = [
+  { value: "light", icon: Sun, label: "Light" },
+  { value: "dark", icon: Moon, label: "Dark" },
+  { value: "system", icon: Monitor, label: "System" },
+];
+
+function AppearanceCard() {
+  const { theme, setTheme } = useTheme();
+  const mounted = useMounted();
+  const elderlyMode = useAppStore((s) => s.elderlyMode);
+  const setElderlyMode = useAppStore((s) => s.setElderlyMode);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("elderly", elderlyMode);
+  }, [elderlyMode]);
+
+  return (
+    <GlassCard className="space-y-5 p-4 sm:p-5">
+      <SectionHeader icon={<Palette className="h-4 w-4" />} title="Appearance" sub="Make HOME SYNC feel like yours" />
+      <div>
+        <Label className="text-xs font-medium text-muted-foreground">Theme</Label>
+        <RadioGroup
+          value={mounted ? theme : undefined}
+          onValueChange={setTheme}
+          className="mt-2 grid grid-cols-3 gap-2"
+        >
+          {THEME_OPTIONS.map((t) => {
+            const selected = mounted && theme === t.value;
+            return (
+              <Label
+                key={t.value}
+                htmlFor={`theme-${t.value}`}
+                className={cn(
+                  "flex cursor-pointer flex-col items-center gap-1.5 rounded-xl border px-2 py-3 text-xs font-medium transition-colors",
+                  selected
+                    ? "border-primary/50 bg-primary/10 text-primary"
+                    : "border-border/70 text-muted-foreground hover:bg-muted/60"
+                )}
+              >
+                <RadioGroupItem id={`theme-${t.value}`} value={t.value} className="sr-only" />
+                <t.icon className="h-5 w-5" aria-hidden />
+                {t.label}
+              </Label>
+            );
+          })}
+        </RadioGroup>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium leading-tight">Elderly-friendly mode</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">Bigger text and buttons across the app</p>
+        </div>
+        <OnOffSegmented
+          label="Elderly-friendly mode"
+          value={mounted && elderlyMode}
+          onChange={(v) => setElderlyMode(v)}
+        />
+      </div>
+    </GlassCard>
+  );
+}
+
+/* ---------- Session (real sign out) ---------- */
+
+function SessionCard() {
+  const user = useSession((s) => s.user);
+  const logout = useSession((s) => s.logout);
+  const [busy, setBusy] = useState(false);
+
+  if (!user) return null;
+
+  async function signOut() {
+    if (busy) return;
+    try {
+      setBusy(true);
+      await logout();
+      toast("Signed out — see you soon");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <GlassCard className="space-y-4 p-4 sm:p-5">
+      <SectionHeader icon={<LogOut className="h-4 w-4" />} title="Session" sub="Signed in with Google" />
+      <div className="glass-inset flex items-center gap-3 rounded-xl p-3">
+        <MemberAvatar name={user.name} color={user.color} role={user.role} photoUrl={user.photoUrl} size={36} />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold leading-tight">{user.name}</p>
+          <p className="truncate text-[11px] text-muted-foreground">{user.email}</p>
+        </div>
+        <Chip>Google</Chip>
+      </div>
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        Signing out ends this session on the server — the cookie is cleared and this device can&apos;t reach your
+        family data until you sign in again.
+      </p>
+      <Button variant="outline" disabled={busy} onClick={() => void signOut()} className="h-10 rounded-xl">
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
+        Sign out
+      </Button>
+    </GlassCard>
+  );
+}
+
+/* ---------- Settings view ---------- */
+
+export function SettingsView() {
+  const user = useSession((s) => s.user);
+  // Administration keys off the session role — the server enforces it independently.
+  const isAdmin = user?.role === "Family Admin";
+
+  const familyRes = useResource<FamilyResponse>("/api/family");
+
+  return (
+    <div className="max-w-3xl space-y-4">
+      <ViewTitle title="Settings" sub="Your profile, family, privacy and session" />
+
+      {/* My profile */}
+      {user ? <ProfileCard /> : null}
+
+      {/* Family (admin only) */}
+      {isAdmin ? <FamilyAdminCard familyRes={familyRes} /> : null}
+
+      {/* Privacy */}
+      <PrivacyCard familyRes={familyRes} />
+
+      {/* Appearance */}
+      <AppearanceCard />
+
+      {/* Session */}
+      <SessionCard />
 
       {/* About */}
       <GlassCard className="p-4 sm:p-5">
@@ -496,7 +656,7 @@ export function SettingsView() {
           <HomeSyncMark size={40} />
           <p className="text-sm font-semibold">HOME SYNC v1.0 • One Home. One Family.</p>
           <p className="text-xs text-muted-foreground">
-            Maps, weather and nearby services stream live data.
+            Weather streams live from Open-Meteo; the family map uses your real home coordinates.
           </p>
         </div>
       </GlassCard>

@@ -1,9 +1,11 @@
 "use client";
 
+import { useEffect } from "react";
 import { useSyncExternalStore } from "react";
 import { AuroraBackground } from "@/components/homesync/aurora";
 import { Shell, LockedView } from "@/components/homesync/shell";
 import { LoginScreen } from "@/components/homesync/login-screen";
+import { OnboardingCreate, PendingApproval } from "@/components/homesync/onboarding";
 import { OverviewView } from "@/components/homesync/views/overview-view";
 import { CalendarView } from "@/components/homesync/views/calendar-view";
 import { TasksView } from "@/components/homesync/views/tasks-view";
@@ -77,17 +79,45 @@ function ActiveView() {
 export default function Home() {
   const mounted = useMounted();
   const user = useSession((s) => s.user);
+  const family = useSession((s) => s.family);
+  const hydrated = useSession((s) => s.hydrated);
+  const hydrate = useSession((s) => s.hydrate);
 
-  if (!mounted) {
+  // Pull the server-verified session once on load — localStorage grants nothing.
+  useEffect(() => {
+    void hydrate();
+  }, [hydrate]);
+
+  if (!mounted || !hydrated) {
     return <Splash />;
   }
 
-  // gate: no session -> liquid glass login (with guest path)
+  // gate 1: no verified session -> Google sign-in
   if (!user) {
     return (
       <>
         <AuroraBackground />
         <LoginScreen />
+      </>
+    );
+  }
+
+  // gate 2: join request still pending admin approval
+  if (user.status === "pending") {
+    return (
+      <>
+        <AuroraBackground />
+        <PendingApproval />
+      </>
+    );
+  }
+
+  // gate 3: signed in but no household yet -> real onboarding
+  if (!family) {
+    return (
+      <>
+        <AuroraBackground />
+        <OnboardingCreate />
       </>
     );
   }

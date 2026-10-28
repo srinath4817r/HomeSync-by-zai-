@@ -1,149 +1,121 @@
 import { NextRequest, NextResponse } from "next/server";
-import type { Prisma } from "@prisma/client";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { logActivity } from "@/lib/homesync/server";
+import { readJson } from "../_lib/http";
 
 export const dynamic = "force-dynamic";
 
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  const body = await req.json().catch(() => null);
-  return body && typeof body === "object" && !Array.isArray(body)
-    ? (body as Record<string, unknown>)
-    : null;
+function serialize(b: {
+  id: string; title: string; category: string; amount: number; currency: string;
+  dueDate: Date; status: string; recurring: string | null; paidAt: Date | null;
+  payerId: string | null; createdAt: Date;
+}) {
+  return {
+    id: b.id,
+    title: b.title,
+    category: b.category,
+    amount: b.amount,
+    currency: b.currency,
+    dueDate: b.dueDate.toISOString(),
+    status: b.status,
+    recurring: b.recurring,
+    paidAt: b.paidAt?.toISOString() ?? null,
+    payerId: b.payerId,
+    createdAt: b.createdAt.toISOString(),
+  };
 }
 
-/** GET /api/bills — due bills first (dueDate asc), then paid (paidAt desc). */
-export async function GET() {
-  try {
-    await ensureSeed();
-    const bills = await db.bill.findMany();
-    bills.sort((a, b) => {
-      const paidA = a.status === "paid" ? 1 : 0;
-      const paidB = b.status === "paid" ? 1 : 0;
-      if (paidA !== paidB) return paidA - paidB;
-      if (paidA === 0) return a.dueDate.getTime() - b.dueDate.getTime();
-      return (b.paidAt?.getTime() ?? 0) - (a.paidAt?.getTime() ?? 0);
-    });
-    return NextResponse.json(bills);
-  } catch (e) {
-    console.error("GET /api/bills failed:", e);
-    return NextResponse.json({ error: "Failed to load bills" }, { status: 500 });
-  }
+/** GET /api/bills — my family's bills. */
+export async function GET(req: NextRequest) {
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const bills = await db.bill.findMany({
+    where: { familyId: ctx.familyId },
+    orderBy: { dueDate: "asc" },
+    take: 300,
+  });
+  return NextResponse.json(bills.map(serialize));
 }
 
-/** POST /api/bills — add a bill reminder. */
+/** POST /api/bills */
 export async function POST(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    if (typeof body.title !== "string" || !body.title.trim()) {
-      return NextResponse.json({ error: "title is required" }, { status: 400 });
-    }
-    if (typeof body.amount !== "number" || !Number.isFinite(body.amount) || body.amount <= 0) {
-      return NextResponse.json({ error: "amount must be a number greater than 0" }, { status: 400 });
-    }
-    if (typeof body.dueDate !== "string") {
-      return NextResponse.json({ error: "dueDate is required" }, { status: 400 });
-    }
-    const dueDate = new Date(body.dueDate);
-    if (Number.isNaN(dueDate.getTime())) {
-      return NextResponse.json({ error: "dueDate must be a valid ISO datetime" }, { status: 400 });
-    }
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const created = await db.bill.create({
-      data: {
-        title: body.title.trim(),
-        amount: body.amount,
-        dueDate,
-        category: typeof body.category === "string" && body.category ? body.category : "Other",
-        payerId: typeof body.payerId === "string" ? body.payerId : null,
-        recurring: typeof body.recurring === "string" ? body.recurring : null,
-        currency: typeof body.currency === "string" && body.currency ? body.currency : "INR",
-      },
-    });
-    return NextResponse.json(created, { status: 201 });
-  } catch (e) {
-    console.error("POST /api/bills failed:", e);
-    return NextResponse.json({ error: "Failed to create bill" }, { status: 500 });
+  const body = await readJson(req);
+  const title = String(body.title ?? "").trim().slice(0, 120);
+  const amount = Number(body.amount);
+  const dueDate = new Date(String(body.dueDate ?? ""));
+  if (!title || !Number.isFinite(amount) || amount < 0 || Number.isNaN(dueDate.getTime())) {
+    return NextResponse.json({ error: "Bill needs a title, a valid amount and due date." }, { status: 400 });
   }
+
+  const bill = await db.bill.create({
+    data: {
+      familyId: ctx.familyId,
+      title,
+      category: typeof body.category === "string" && body.category ? body.category.slice(0, 30) : "Other",
+      amount,
+      currency: typeof body.currency === "string" && body.currency ? body.currency.slice(0, 6) : "INR",
+      dueDate,
+      recurring: typeof body.recurring === "string" && body.recurring ? body.recurring : null,
+      payerId: typeof body.payerId === "string" && body.payerId ? body.payerId : null,
+      createdById: ctx.user.id,
+    },
+  });
+  await logActivity(ctx.familyId, ctx.user, "added bill", title);
+  return NextResponse.json({ bill: serialize(bill) });
 }
 
-/** PATCH /api/bills — update partial fields; handles paid ↔ due transitions. */
+/** PATCH /api/bills — edits + "mark paid" (records WHO marked it, never fakes a payment). */
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
 
-    const existing = await db.bill.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Bill not found" }, { status: 404 });
-
-    const data: Prisma.BillUpdateInput = {};
-    if (body.title !== undefined) {
-      if (typeof body.title !== "string" || !body.title.trim()) {
-        return NextResponse.json({ error: "title must be a non-empty string" }, { status: 400 });
-      }
-      data.title = body.title.trim();
-    }
-    if (typeof body.category === "string" && body.category) data.category = body.category;
-    if (typeof body.amount === "number" && Number.isFinite(body.amount)) data.amount = body.amount;
-    if (typeof body.currency === "string" && body.currency) data.currency = body.currency;
-    if (body.dueDate === null) data.dueDate = existing.dueDate; // dueDate is required — ignore null
-    else if (typeof body.dueDate === "string") {
-      const d = new Date(body.dueDate);
-      if (Number.isNaN(d.getTime())) {
-        return NextResponse.json({ error: "dueDate must be a valid ISO datetime" }, { status: 400 });
-      }
-      data.dueDate = d;
-    }
-    if (typeof body.status === "string" && body.status) data.status = body.status;
-    if (body.payerId === null || typeof body.payerId === "string") data.payerId = body.payerId;
-    if (body.recurring === null || typeof body.recurring === "string") data.recurring = body.recurring;
-
-    // Reopening a bill clears its paid timestamp.
-    if (data.status === "due") data.paidAt = null;
-
-    let paidActor: string | null = null;
-    if (data.status === "paid" && existing.status !== "paid") {
-      if (!existing.paidAt) data.paidAt = new Date();
-      const payerId = (typeof body.payerId === "string" ? body.payerId : undefined) ?? existing.payerId;
-      const payer = payerId ? await db.member.findUnique({ where: { id: payerId } }) : null;
-      paidActor = payer?.name ?? req.headers.get("X-HS-Actor") ?? "Family";
-    }
-
-    const updated = await db.bill.update({ where: { id }, data });
-
-    if (paidActor) {
-      await db.activityLog.create({
-        data: { actor: paidActor, action: "marked bill paid", target: updated.title },
-      });
-    }
-
-    return NextResponse.json(updated);
-  } catch (e) {
-    console.error("PATCH /api/bills failed:", e);
-    return NextResponse.json({ error: "Failed to update bill" }, { status: 500 });
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const bill = await db.bill.findUnique({ where: { id } });
+  if (!bill || bill.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Bill not found." }, { status: 404 });
   }
+
+  const data: Record<string, unknown> = {};
+  if (typeof body.title === "string" && body.title.trim()) data.title = body.title.trim().slice(0, 120);
+  if (typeof body.category === "string" && body.category) data.category = body.category.slice(0, 30);
+  if (Number.isFinite(Number(body.amount)) && Number(body.amount) >= 0) data.amount = Number(body.amount);
+  if (typeof body.dueDate === "string") {
+    const d = new Date(body.dueDate);
+    if (!Number.isNaN(d.getTime())) data.dueDate = d;
+  }
+  if (["due", "paid"].includes(String(body.status))) {
+    data.status = body.status;
+    // "paid" = a household member records the payment; not a payment-provider confirmation.
+    data.paidAt = body.status === "paid" ? new Date() : null;
+  }
+  if (body.payerId === null || typeof body.payerId === "string") data.payerId = body.payerId || null;
+  if (typeof body.recurring === "string") data.recurring = body.recurring || null;
+
+  if (Object.keys(data).length === 0) {
+    return NextResponse.json({ error: "Nothing to update." }, { status: 400 });
+  }
+  const updated = await db.bill.update({ where: { id }, data });
+  if (data.status === "paid") {
+    await logActivity(ctx.familyId, ctx.user, "marked bill paid", updated.title);
+  }
+  return NextResponse.json({ bill: serialize(updated) });
 }
 
-/** DELETE /api/bills — remove a bill by id (JSON body, searchParams fallback). */
+/** DELETE /api/bills */
 export async function DELETE(req: NextRequest) {
-  try {
-    const body = await readBody(req);
-    const id =
-      (body && typeof body.id === "string" ? body.id : "") ||
-      req.nextUrl.searchParams.get("id") ||
-      "";
-    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 });
-
-    const existing = await db.bill.findUnique({ where: { id } });
-    if (!existing) return NextResponse.json({ error: "Bill not found" }, { status: 404 });
-
-    await db.bill.delete({ where: { id } });
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /api/bills failed:", e);
-    return NextResponse.json({ error: "Failed to delete bill" }, { status: 500 });
+  const ctx = await requireFamily(req);
+  if (isGuardFailure(ctx)) return ctx;
+  const body = await readJson(req);
+  const id = String(body.id ?? "");
+  const bill = await db.bill.findUnique({ where: { id } });
+  if (!bill || bill.familyId !== ctx.familyId) {
+    return NextResponse.json({ error: "Bill not found." }, { status: 404 });
   }
+  await db.bill.delete({ where: { id } });
+  return NextResponse.json({ ok: true });
 }

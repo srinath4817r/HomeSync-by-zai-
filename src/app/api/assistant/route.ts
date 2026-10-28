@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import ZAI from "z-ai-web-dev-sdk";
 import type { ProposedAction } from "@/lib/homesync/types";
 import { db } from "@/lib/db";
-import { ensureSeed } from "@/lib/homesync/seed";
+import { isGuardFailure, requireUser } from "@/lib/homesync/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -74,8 +74,8 @@ function parseISODate(value: string): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** Compact household context handed to the LLM — includes live member locations. */
-async function buildContext() {
+/** Compact household context handed to the LLM — REAL data from the caller's family only. */
+async function buildContext(familyId: string) {
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   const end = new Date(start);
@@ -84,11 +84,11 @@ async function buildContext() {
     d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
 
   const [members, events, tasks, bills, groceries] = await Promise.all([
-    db.member.findMany({ orderBy: { createdAt: "asc" } }),
-    db.event.findMany({ where: { startAt: { gte: start, lt: end } }, orderBy: { startAt: "asc" } }),
-    db.task.findMany({ where: { status: { not: "done" } }, orderBy: { dueAt: "asc" } }),
-    db.bill.findMany({ where: { status: "due" }, orderBy: { dueDate: "asc" } }),
-    db.groceryItem.findMany({ where: { status: "needed" }, orderBy: { createdAt: "asc" } }),
+    db.member.findMany({ where: { familyId }, orderBy: { createdAt: "asc" } }),
+    db.event.findMany({ where: { familyId, startAt: { gte: start, lt: end } }, orderBy: { startAt: "asc" } }),
+    db.task.findMany({ where: { familyId, status: { not: "done" } }, orderBy: { dueAt: "asc" } }),
+    db.bill.findMany({ where: { familyId, status: "due" }, orderBy: { dueDate: "asc" } }),
+    db.groceryItem.findMany({ where: { familyId, status: "needed" }, orderBy: { createdAt: "asc" } }),
   ]);
 
   const now = Date.now();
@@ -97,10 +97,11 @@ async function buildContext() {
       name: m.name,
       relation: m.relation,
       role: m.role,
-      location:
-        m.locationSharing && m.locationLabel
-          ? `${m.locationLabel} (updated ${m.locationUpdatedAt ? Math.max(0, Math.round((now - new Date(m.locationUpdatedAt).getTime()) / 60000)) : "?"} min ago)`
-          : "location sharing off",
+      location: m.locationSharing
+        ? m.placeLabel
+          ? m.placeLabel
+          : "sharing on — live position on the family map"
+        : "location sharing off",
     })),
     todayEvents: events.map((e) => `${e.title} at ${fmt(e.startAt)}${e.location ? ` (${e.location})` : ""}`),
     pendingTasks: tasks.map((t) => `${t.title}${t.assigneeId ? "" : ""}`),
@@ -249,10 +250,10 @@ function extractReply(rawReply: string): { content: string; actions: ProposedAct
 }
 
 /** Resolve a member by case-insensitive name OR relation (e.g. "Dad"). */
-async function resolveMemberId(query: string): Promise<string | null> {
+async function resolveMemberId(familyId: string, query: string): Promise<string | null> {
   const q = query.trim().toLowerCase();
   if (!q) return null;
-  const members = await db.member.findMany();
+  const members = await db.member.findMany({ where: { familyId } });
   const found = members.find(
     (m) =>
       m.name.toLowerCase() === q ||
@@ -264,13 +265,17 @@ async function resolveMemberId(query: string): Promise<string | null> {
 }
 
 /** Execute an accepted proposed action and log the corresponding activity. */
-async function executeAction(action: ProposedAction, actor: string): Promise<string | null> {
+async function executeAction(
+  action: ProposedAction,
+  actor: { id: string; name: string },
+  familyId: string
+): Promise<string | null> {
   switch (action.kind) {
     case "add_task": {
       const title = typeof action.title === "string" ? action.title.trim() : "";
       if (!title) return null;
       const assigneeId =
-        typeof action.assigneeName === "string" ? await resolveMemberId(action.assigneeName) : null;
+        typeof action.assigneeName === "string" ? await resolveMemberId(familyId, action.assigneeName) : null;
       let dueAt: Date | null = null;
       if (typeof action.time === "string") {
         const t = parseTimeLabel(action.time);
@@ -281,14 +286,16 @@ async function executeAction(action: ProposedAction, actor: string): Promise<str
       }
       await db.task.create({
         data: {
+          familyId,
           title,
+          creatorId: actor.id,
           assigneeId,
           dueAt,
           recurring: typeof action.recurring === "string" && action.recurring ? action.recurring : null,
         },
       });
       await db.activityLog.create({
-        data: { actor, action: "created task via AI assistant", target: title },
+        data: { familyId, actorId: actor.id, actor: actor.name, action: "created task via AI assistant", target: title },
       });
       return `task "${title}"`;
     }
@@ -296,20 +303,22 @@ async function executeAction(action: ProposedAction, actor: string): Promise<str
       const name = typeof action.name === "string" ? action.name.trim() : "";
       if (!name) return null;
       // SQLite has no case-insensitive filter — dedupe in JS.
-      const needed = await db.groceryItem.findMany({ where: { status: "needed" }, select: { name: true } });
+      const needed = await db.groceryItem.findMany({ where: { familyId, status: "needed" }, select: { name: true } });
       if (needed.some((g) => g.name.toLowerCase() === name.toLowerCase())) {
         return `${name} (already on the list)`;
       }
       await db.groceryItem.create({
         data: {
+          familyId,
           name,
           quantity: typeof action.quantity === "string" ? action.quantity : "",
           category:
             typeof action.category === "string" && action.category ? action.category : "Other",
+          addedById: actor.id,
         },
       });
       await db.activityLog.create({
-        data: { actor, action: "added grocery via AI assistant", target: name },
+        data: { familyId, actorId: actor.id, actor: actor.name, action: "added grocery via AI assistant", target: name },
       });
       return name;
     }
@@ -322,14 +331,16 @@ async function executeAction(action: ProposedAction, actor: string): Promise<str
       startAt.setHours(time ? time.h : 18, time ? time.m : 0, 0, 0);
       await db.event.create({
         data: {
+          familyId,
           title,
           startAt,
+          createdById: actor.id,
           location:
             typeof action.location === "string" && action.location ? action.location : null,
         },
       });
       await db.activityLog.create({
-        data: { actor, action: "created event via AI assistant", target: title },
+        data: { familyId, actorId: actor.id, actor: actor.name, action: "created event via AI assistant", target: title },
       });
       return `event "${title}"`;
     }
@@ -344,9 +355,9 @@ async function executeAction(action: ProposedAction, actor: string): Promise<str
         typeof action.amount === "number" && Number.isFinite(action.amount) && action.amount > 0
           ? action.amount
           : 0;
-      await db.bill.create({ data: { title, amount, dueDate: due } });
+      await db.bill.create({ data: { familyId, title, amount, dueDate: due, createdById: actor.id } });
       await db.activityLog.create({
-        data: { actor, action: "created bill via AI assistant", target: title },
+        data: { familyId, actorId: actor.id, actor: actor.name, action: "created bill via AI assistant", target: title },
       });
       return `bill "${title}"`;
     }
@@ -356,10 +367,12 @@ async function executeAction(action: ProposedAction, actor: string): Promise<str
 }
 
 /** GET /api/assistant — latest 50 messages, oldest first. */
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    await ensureSeed();
+    const auth = await requireUser(req);
+    if (isGuardFailure(auth)) return auth;
     const rows = await db.assistantMessage.findMany({
+      where: { userId: auth.id },
       orderBy: { createdAt: "desc" },
       take: 50,
     });
@@ -374,19 +387,32 @@ export async function GET() {
 /** POST /api/assistant — save user message, get LLM reply, extract the action batch. */
 export async function POST(req: NextRequest) {
   try {
-    await ensureSeed();
+    const auth = await requireUser(req);
+    if (isGuardFailure(auth)) return auth;
+
+    // The assistant acts on the caller's real family; require an active membership.
+    const membership = await db.membership.findFirst({
+      where: { userId: auth.id, status: "active" },
+    });
+    if (!membership) {
+      return NextResponse.json(
+        { error: "Create or join a family first — then I can help with your home." },
+        { status: 403 }
+      );
+    }
+
     const body = await readBody(req);
     if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     const message = typeof body.message === "string" ? body.message.trim() : "";
     if (!message) return NextResponse.json({ error: "message is required" }, { status: 400 });
-    const actor = req.headers.get("X-HS-Actor") ?? "Family";
 
     await db.assistantMessage.create({
-      data: { role: "user", content: message, action: null, actionStatus: null },
+      data: { userId: auth.id, role: "user", content: message, action: null, actionStatus: null },
     });
 
     // Recent conversation so the assistant keeps context across turns.
     const historyRows = await db.assistantMessage.findMany({
+      where: { userId: auth.id },
       orderBy: { createdAt: "desc" },
       take: 15,
     });
@@ -394,7 +420,7 @@ export async function POST(req: NextRequest) {
 
     let reply: string | null = null;
     try {
-      const context = await buildContext();
+      const context = await buildContext(membership.familyId);
       const zai = await ZAI.create();
       const chat: ChatMessage[] = [
         { role: "system", content: buildSystemPrompt(context) },
@@ -417,6 +443,7 @@ export async function POST(req: NextRequest) {
     if (!reply || !reply.trim()) {
       const fallback = await db.assistantMessage.create({
         data: {
+          userId: auth.id,
           role: "assistant",
           content: "I couldn't reach the AI service just now. Please try again in a moment.",
           action: null,
@@ -431,6 +458,7 @@ export async function POST(req: NextRequest) {
 
     const assistantMessage = await db.assistantMessage.create({
       data: {
+        userId: auth.id,
         role: "assistant",
         content,
         action: realActions.length > 0 ? JSON.stringify(realActions) : null,
@@ -447,6 +475,14 @@ export async function POST(req: NextRequest) {
 /** PATCH /api/assistant — { id, actionStatus }. "accepted" executes the full proposed batch. */
 export async function PATCH(req: NextRequest) {
   try {
+    const auth = await requireUser(req);
+    if (isGuardFailure(auth)) return auth;
+
+    // Executing proposals needs the caller's real family — same rule as POST.
+    const membership = await db.membership.findFirst({
+      where: { userId: auth.id, status: "active" },
+    });
+
     const body = await readBody(req);
     if (!body) return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     const id = typeof body.id === "string" ? body.id : "";
@@ -468,7 +504,13 @@ export async function PATCH(req: NextRequest) {
       const actions = parseActions(message.action).filter((a) => a.kind !== "none");
       const created: string[] = [];
       for (const action of actions) {
-        const result = await executeAction(action, actor);
+        if (!membership) {
+          return NextResponse.json(
+            { error: "Create or join a family first — then I can add things for your home." },
+            { status: 403 }
+          );
+        }
+        const result = await executeAction(action, { id: auth.id, name: auth.name }, membership.familyId);
         if (result) created.push(result);
       }
       if (created.length > 0 && message.content.length < 2000) {

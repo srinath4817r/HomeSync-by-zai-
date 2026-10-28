@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useSession } from "./session";
 
 /** Fetch JSON from an API endpoint. Throws Error with server-provided message. */
 export async function apiGet<T>(url: string): Promise<T> {
@@ -11,19 +10,19 @@ export async function apiGet<T>(url: string): Promise<T> {
   return body as T;
 }
 
-/** Send a mutation (POST / PATCH / DELETE) with JSON body. Attaches the signed-in user as X-HS-Actor so API activity logs can attribute the action. */
+/**
+ * Send a mutation (POST / PATCH / DELETE) with JSON body.
+ * Identity comes from the httpOnly session cookie — the server attributes
+ * every action itself; the client cannot claim an actor.
+ */
 export async function apiSend<T>(
   url: string,
   method: "POST" | "PATCH" | "DELETE",
   body?: unknown
 ): Promise<T> {
-  const actor = useSession.getState().user?.name;
   const res = await fetch(url, {
     method,
-    headers: {
-      "Content-Type": "application/json",
-      ...(actor ? { "X-HS-Actor": actor } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
