@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { createSession, setSessionCookie } from "@/lib/homesync/auth";
+import { clientKey, rateLimit } from "@/lib/homesync/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -49,6 +50,8 @@ function readJson(req: NextRequest): Promise<Record<string, unknown>> {
  * password accounts.
  */
 export async function POST(req: NextRequest) {
+  const limited = rateLimit(clientKey(req, "google-oauth"), 10, 15 * 60_000);
+  if (limited) return limited;
   try {
     const clientId = process.env.GOOGLE_CLIENT_ID?.trim() ?? "";
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim() ?? "";

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
 import { generateInviteCode, readJson } from "../../_lib/http";
+import { rateLimit } from "@/lib/homesync/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -31,6 +32,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const ctx = await requireFamily(req, { adminOnly: true });
   if (isGuardFailure(ctx)) return ctx;
+  const limited = rateLimit(`invite:${ctx.user.id}`, 20, 60 * 60_000);
+  if (limited) return limited;
 
   const body = await readJson(req);
   const daysRaw = Number(body.expiresInDays);

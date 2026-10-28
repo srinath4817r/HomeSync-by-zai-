@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { isGuardFailure, requireUser } from "@/lib/homesync/auth";
 import { readJson } from "../../_lib/http";
+import { rateLimit } from "@/lib/homesync/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,8 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   const auth = await requireUser(req);
   if (isGuardFailure(auth)) return auth;
+  const limited = rateLimit(`join:${auth.id}`, 10, 15 * 60_000);
+  if (limited) return limited;
 
   const body = await readJson(req);
   const code = String(body.code ?? "").trim().toUpperCase();

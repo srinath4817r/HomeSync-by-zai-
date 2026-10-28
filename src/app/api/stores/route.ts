@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { rateLimit } from "@/lib/homesync/rate-limit";
 import { searchNearbyPlaces } from "../nearby/places";
 
 export const dynamic = "force-dynamic";
@@ -19,6 +20,8 @@ const ALLOWED_RADIUS = new Set(["1", "3", "5", "10"]);
 export async function GET(req: NextRequest) {
   const ctx = await requireFamily(req);
   if (isGuardFailure(ctx)) return ctx;
+  const limited = rateLimit(`nearby:${ctx.user.id}`, 30, 5 * 60_000);
+  if (limited) return limited;
 
   const sp = req.nextUrl.searchParams;
   const category = sp.get("category")?.slice(0, 40) ?? null;

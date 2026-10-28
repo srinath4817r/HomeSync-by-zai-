@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { isGuardFailure, requireFamily } from "@/lib/homesync/auth";
+import { rateLimit } from "@/lib/homesync/rate-limit";
 import { readJson } from "../_lib/http";
 import { searchNearbyPlaces } from "./places";
 
@@ -87,6 +88,8 @@ async function handle(
 export async function GET(req: NextRequest) {
   const ctx = await requireFamily(req);
   if (isGuardFailure(ctx)) return ctx;
+  const limited = rateLimit(`nearby:${ctx.user.id}`, 30, 5 * 60_000);
+  if (limited) return limited;
   return handle(ctx.familyId, parseParams(req.nextUrl.searchParams));
 }
 
@@ -94,6 +97,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const ctx = await requireFamily(req);
   if (isGuardFailure(ctx)) return ctx;
+  const limited = rateLimit(`nearby:${ctx.user.id}`, 30, 5 * 60_000);
+  if (limited) return limited;
   const body = await readJson(req);
   return handle(ctx.familyId, parseParams(body));
 }

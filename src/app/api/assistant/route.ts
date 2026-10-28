@@ -3,6 +3,7 @@ import ZAI from "z-ai-web-dev-sdk";
 import type { ProposedAction } from "@/lib/homesync/types";
 import { db } from "@/lib/db";
 import { isGuardFailure, requireUser } from "@/lib/homesync/auth";
+import { rateLimit } from "@/lib/homesync/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -389,6 +390,9 @@ export async function POST(req: NextRequest) {
   try {
     const auth = await requireUser(req);
     if (isGuardFailure(auth)) return auth;
+    // LLM calls are costly — one conversation turn every few seconds max.
+    const limited = rateLimit(`assistant:${auth.id}`, 20, 5 * 60_000);
+    if (limited) return limited;
 
     // The assistant acts on the caller's real family; require an active membership.
     const membership = await db.membership.findFirst({
